@@ -21,19 +21,22 @@ func NewLogActionLogger(ctx context.Context, dispatch func(action Action)) logge
 	})
 }
 
-// nonBlockingGlobalLogWriter is installed only on the context passed to a
-// Store reducer. A reducer can log while it is responsible for draining this
-// ingress, so waiting for capacity there would deadlock the control loop. The
-// process-wide logger intentionally does not use this writer: external log
-// producers must apply backpressure.
-type nonBlockingGlobalLogWriter struct {
-	store *Store
+// nonBlockingLogWriter wraps only the context passed to Store reducers. It
+// preserves the existing handler's routing, while making a synchronous
+// Dispatch inside that handler safe when the reducer has exhausted ingress.
+// The process-wide logger remains blocking for all external producers.
+type nonBlockingLogWriter struct {
+	store          *Store
+	previousLogger logger.Logger
 }
 
-func (w nonBlockingGlobalLogWriter) Write(level logger.Level, fields logger.Fields, p []byte) error {
-	action := NewGlobalLogAction(level, p)
-	action.nonBlockingIngress = true
-	w.store.Dispatch(action)
+func (w nonBlockingLogWriter) Write(level logger.Level, fields logger.Fields, p []byte) error {
+	w.store.loopLogWriteInProgress.Add(1)
+	defer w.store.loopLogWriteInProgress.Add(-1)
+
+	// WithFields preserves fields supplied by the wrapper logger before
+	// forwarding the exact level and payload to the context's prior route.
+	w.previousLogger.WithFields(fields).Write(level, p)
 	return nil
 }
 

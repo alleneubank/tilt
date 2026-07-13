@@ -65,6 +65,15 @@ type Store struct {
 	// drainStarts is observability for drain goroutines started by Dispatch.
 	drainStarts atomic.Int64
 
+	// loopLogWriteInProgress is non-zero only while the reducer's context logger
+	// synchronously forwards a write to its prior handler. That handler can call
+	// Dispatch on the loop goroutine, which must not wait for capacity that only
+	// the loop can release. An external dispatch that races inside this tiny
+	// window can also over-admit; its bytes are still counted and the budget
+	// self-corrects. Keeping the window to a single write avoids an unbounded
+	// bypass during a saturated reducer call.
+	loopLogWriteInProgress atomic.Int32
+
 	// TODO(nick): Define Subscribers and Reducers.
 	// The actionChan is an intermediate representation to make the transition easier.
 }
@@ -157,15 +166,14 @@ func (s *Store) Dispatch(action Action) {
 	logBytes := logActionPayloadBytes(action)
 
 	s.ingressMu.Lock()
-	// Logger actions are dispatched from the reducer's context. They must never
-	// wait for bytes that only that reducer can release, or a full ingress queue
-	// would deadlock the control loop. They still count toward the budget, which
-	// makes external log producers apply backpressure until the reducer catches up.
+	// A logger action synchronously dispatched while the loop forwards a reducer
+	// log must never wait for bytes that only that loop can release. It still
+	// counts toward the budget, so external log producers apply backpressure.
 	//
 	// External producers use a soft limit: the payload that crosses the cap is
 	// admitted, then later producers wait. This bounds overshoot to one external
 	// payload without dropping any logs.
-	for logBytes > 0 && !logActionBypassesBudget(action) && s.queuedLogBytes.Load() > maxQueuedLogBytes && !s.closedStore && !s.workerStopped {
+	for logBytes > 0 && s.loopLogWriteInProgress.Load() == 0 && s.queuedLogBytes.Load() > maxQueuedLogBytes && !s.closedStore && !s.workerStopped {
 		s.logBudget.Wait()
 	}
 	if s.closedStore || s.workerStopped {
@@ -236,12 +244,12 @@ func (s *Store) Loop(ctx context.Context) error {
 	defer s.subscribers.TeardownAll(context.Background())
 	defer s.stopDrainWorker()
 
-	// Only reducers receive a non-blocking log handler. NewLogActionLogger is
-	// also installed as the CLI's root logger, so marking its actions specially
-	// would let every external producer bypass ingress backpressure.
+	// Only reducer log writes receive the bounded non-blocking admission window.
+	// Keep the context's existing handler in the chain: it owns routing to
+	// manifest spans, CLI store dispatch, and test capture buffers.
 	loopCtx := ctx
-	if ctx.Value(logger.LoggerContextKey) != nil {
-		loopCtx = logger.CtxWithLogHandler(ctx, nonBlockingGlobalLogWriter{store: s})
+	if previousLogger, ok := ctx.Value(logger.LoggerContextKey).(logger.Logger); ok {
+		loopCtx = logger.CtxWithLogHandler(ctx, nonBlockingLogWriter{store: s, previousLogger: previousLogger})
 	}
 
 	// Set up a defer handler, and make sure to unlock the state
@@ -342,17 +350,6 @@ func logActionPayloadBytes(action Action) int64 {
 		return int64(len(action.msg))
 	default:
 		return 0
-	}
-}
-
-func logActionBypassesBudget(action Action) bool {
-	switch action := action.(type) {
-	case LogAction:
-		return action.nonBlockingIngress
-	case *LogAction:
-		return action.nonBlockingIngress
-	default:
-		return false
 	}
 }
 

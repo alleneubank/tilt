@@ -227,6 +227,25 @@ type reducerDispatchAction struct{}
 
 func (reducerDispatchAction) Action() {}
 
+type reducerLogRoutingAction struct{}
+
+func (reducerLogRoutingAction) Action() {}
+
+type capturedLogWrite struct {
+	level   logger.Level
+	fields  logger.Fields
+	message []byte
+}
+
+type logWriteCapture struct {
+	writes chan capturedLogWrite
+}
+
+func (c logWriteCapture) Write(level logger.Level, fields logger.Fields, message []byte) error {
+	c.writes <- capturedLogWrite{level: level, fields: fields, message: append([]byte{}, message...)}
+	return nil
+}
+
 func logActionWithPayload(payload []byte) LogAction {
 	return NewLogAction(
 		model.ManifestName("firehose"),
@@ -235,6 +254,31 @@ func logActionWithPayload(payload []byte) LogAction {
 		nil,
 		payload,
 	)
+}
+
+func TestLoopLoggerPreservesContextLogHandler(t *testing.T) {
+	writes := make(chan capturedLogWrite, 1)
+	ctx := logger.WithLogger(context.Background(), logger.NewTestLogger(io.Discard))
+	ctx = logger.CtxWithLogHandler(ctx, logWriteCapture{writes: writes})
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	loopDone := make(chan error, 1)
+	store := NewStore(Reducer(func(ctx context.Context, state *EngineState, action Action) {
+		if _, ok := action.(reducerLogRoutingAction); ok {
+			logger.Get(ctx).WithFields(logger.Fields{"source": "reducer"}).Write(logger.ErrorLvl, []byte("preserve this route"))
+		}
+	}), false)
+	go func() { loopDone <- store.Loop(ctx) }()
+
+	store.Dispatch(reducerLogRoutingAction{})
+	write := receive(t, writes, "the context log handler to receive reducer output")
+	assert.Equal(t, logger.ErrorLvl, write.level)
+	assert.Equal(t, logger.Fields{"source": "reducer"}, write.fields)
+	assert.Equal(t, []byte("preserve this route"), write.message)
+
+	cancel()
+	require.ErrorIs(t, receive(t, loopDone, "the canceled store loop to stop"), context.Canceled)
 }
 
 func fillLogBudget(t *testing.T, store *Store, payload []byte) {
@@ -265,7 +309,9 @@ func TestLogBudgetDoesNotBlockControlOrReducerDispatch(t *testing.T) {
 		close(reducerLogReturned)
 	}), false)
 
-	ctx, cancel := context.WithCancel(logger.WithLogger(context.Background(), logger.NewTestLogger(io.Discard)))
+	baseCtx := logger.WithLogger(context.Background(), logger.NewTestLogger(io.Discard))
+	ctx, cancel := context.WithCancel(baseCtx)
+	ctx = logger.WithLogger(ctx, NewLogActionLogger(ctx, store.Dispatch))
 	defer cancel()
 	go func() { loopDone <- store.Loop(ctx) }()
 

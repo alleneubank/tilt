@@ -30,10 +30,6 @@ type LogAction struct {
 	fields    logger.Fields
 	msg       []byte
 	level     logger.Level
-
-	// nonBlockingIngress marks log actions emitted by the Store's reducer
-	// context. A reducer must not wait for capacity that only it can release.
-	nonBlockingIngress bool
 }
 
 func (LogAction) Action() {}
