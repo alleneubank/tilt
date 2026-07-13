@@ -13,10 +13,7 @@ import (
 	"github.com/tilt-dev/tilt/pkg/model/logstore"
 )
 
-// These are the ingress limits the bounded implementation will enforce in
-// phase 2. Keeping them here makes this phase a regression harness only.
 const (
-	maxQueuedLogBytes                 = 32 * 1024 * 1024
 	maxAdditionalDrainGoroutines      = 8
 	retentionLogActionCount           = 9_000
 	logActionPayloadSize              = 8 * 1024
@@ -134,14 +131,16 @@ func testBoundedLogRetention(t *testing.T) {
 		}
 	}()
 
-	actionsBeforeBackpressure := maxQueuedLogBytes / logActionPayloadSize
+	// Dispatch admits the action that crosses the limit so a reducer-originated
+	// log dispatch cannot deadlock. The following producer is backpressured.
+	actionsBeforeBackpressure := int(maxQueuedLogBytes/int64(logActionPayloadSize)) + 1
 	for expected := 1; expected <= actionsBeforeBackpressure; expected++ {
 		require.Equal(t, expected, receive(t, progress, "the next log action to be accepted"))
 		continueDispatch <- struct{}{}
 	}
 
 	// Green after phase 2: accepting the next action blocks the producer at the
-	// byte budget while this reducer is stalled. The unbounded implementation
+	// soft byte budget while this reducer is stalled. The unbounded implementation
 	// instead reports that action and can be driven through the entire firehose.
 	extraActionAccepted := false
 	for range 1_000 {
@@ -166,9 +165,9 @@ func testBoundedLogRetention(t *testing.T) {
 	}
 
 	retained := stalled.store.QueuedLogBytesForTesting()
-	assert.LessOrEqualf(t, retained, int64(maxQueuedLogBytes),
-		"retained %d queued bytes after attempting %d log actions; limit is %d bytes",
-		retained, retentionLogActionCount, maxQueuedLogBytes)
+	assert.LessOrEqualf(t, retained, maxQueuedLogBytes+logActionPayloadSize,
+		"retained %d queued bytes after attempting %d log actions; soft limit is %d bytes",
+		retained, retentionLogActionCount, maxQueuedLogBytes+logActionPayloadSize)
 
 	stalled.releaseReducer()
 	for {
@@ -185,8 +184,6 @@ producerFinished:
 }
 
 func TestDispatchDoesNotAmplifyDrainGoroutines(t *testing.T) {
-	t.Skip("red until bounded ingress lands — see backpressure design in this file")
-
 	stalled := newStalledStore(t, goroutineAmplificationActionCount)
 	payload := make([]byte, logActionPayloadSize)
 	progress := make(chan struct{}, 1)
@@ -222,7 +219,138 @@ func TestDispatchDoesNotAmplifyDrainGoroutines(t *testing.T) {
 }
 
 func TestBoundedLogRetention(t *testing.T) {
-	t.Skip("red until bounded ingress lands — see backpressure design in this file")
-
 	testBoundedLogRetention(t)
+}
+
+type reducerDispatchAction struct{}
+
+func (reducerDispatchAction) Action() {}
+
+func logActionWithPayload(payload []byte) LogAction {
+	return NewLogAction(
+		model.ManifestName("firehose"),
+		logstore.SpanID("backpressure"),
+		logger.InfoLvl,
+		nil,
+		payload,
+	)
+}
+
+func fillLogBudget(t *testing.T, store *Store, payload []byte) {
+	t.Helper()
+	for range maxQueuedLogBytes / int64(len(payload)) {
+		store.Dispatch(logActionWithPayload(payload))
+	}
+	require.Equal(t, maxQueuedLogBytes, store.QueuedLogBytesForTesting())
+}
+
+func TestLogBudgetDoesNotBlockControlOrReducerDispatch(t *testing.T) {
+	payload := make([]byte, logActionPayloadSize)
+	started := make(chan struct{})
+	releaseReducer := make(chan struct{})
+	reducerLogReturned := make(chan struct{})
+	loopDone := make(chan error, 1)
+	var store *Store
+	store = NewStore(Reducer(func(ctx context.Context, state *EngineState, action Action) {
+		if _, ok := action.(reducerDispatchAction); !ok {
+			return
+		}
+		close(started)
+		<-releaseReducer
+		store.Dispatch(logActionWithPayload(payload))
+		close(reducerLogReturned)
+	}), false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { loopDone <- store.Loop(ctx) }()
+
+	store.Dispatch(reducerDispatchAction{})
+	receive(t, started, "the reducer to stall")
+	fillLogBudget(t, store, payload)
+
+	controlReturned := make(chan struct{})
+	go func() {
+		store.Dispatch(CompletedBuildAction{})
+		close(controlReturned)
+	}()
+	receive(t, controlReturned, "a control action to bypass the log budget")
+
+	close(releaseReducer)
+	receive(t, reducerLogReturned, "a reducer-originated log dispatch to return")
+	store.Close()
+	require.NoError(t, receive(t, loopDone, "the closed store loop to stop"))
+}
+
+func TestCloseUnblocksBackpressuredLogDispatch(t *testing.T) {
+	payload := make([]byte, logActionPayloadSize)
+	started := make(chan struct{})
+	releaseReducer := make(chan struct{})
+	loopDone := make(chan error, 1)
+	store := NewStore(Reducer(func(ctx context.Context, state *EngineState, action Action) {
+		if _, ok := action.(stalledReducerAction); ok {
+			close(started)
+			<-releaseReducer
+		}
+	}), false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { loopDone <- store.Loop(ctx) }()
+	store.Dispatch(stalledReducerAction{})
+	receive(t, started, "the reducer to stall")
+	fillLogBudget(t, store, payload)
+	store.Dispatch(logActionWithPayload(payload)) // the one-payload soft-cap overage
+
+	returned := make(chan struct{})
+	go func() {
+		store.Dispatch(logActionWithPayload(payload))
+		close(returned)
+	}()
+
+	select {
+	case <-returned:
+		t.Fatal("log dispatch returned despite the exhausted byte budget")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	store.Close()
+	receive(t, returned, "the blocked log dispatch to unblock during Close")
+	close(releaseReducer)
+	require.NoError(t, receive(t, loopDone, "the closed store loop to stop"))
+}
+
+func TestLoopCancellationUnblocksBackpressuredLogDispatch(t *testing.T) {
+	payload := make([]byte, logActionPayloadSize)
+	started := make(chan struct{})
+	loopDone := make(chan error, 1)
+	store := NewStore(Reducer(func(ctx context.Context, state *EngineState, action Action) {
+		if _, ok := action.(stalledReducerAction); ok {
+			close(started)
+			<-ctx.Done()
+		}
+	}), false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { loopDone <- store.Loop(ctx) }()
+	store.Dispatch(stalledReducerAction{})
+	receive(t, started, "the reducer to stall")
+	fillLogBudget(t, store, payload)
+	store.Dispatch(logActionWithPayload(payload)) // the one-payload soft-cap overage
+
+	returned := make(chan struct{})
+	go func() {
+		store.Dispatch(logActionWithPayload(payload))
+		close(returned)
+	}()
+
+	select {
+	case <-returned:
+		t.Fatal("log dispatch returned despite the exhausted byte budget")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	cancel()
+	receive(t, returned, "the blocked log dispatch to unblock during cancellation")
+	require.ErrorIs(t, receive(t, loopDone, "the canceled store loop to stop"), context.Canceled)
 }

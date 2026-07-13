@@ -16,6 +16,12 @@ import (
 // Allow actions to batch together a bit.
 const actionBatchWindow = time.Millisecond
 
+// maxQueuedLogBytes bounds log payloads that have entered the Store but have
+// not reached the reducer. A firehose from `tilt up --stream=true` previously
+// accumulated this queue until Tilt was OOM-killed. LogStore's 2 MiB limit is
+// applied only after reduction, so it cannot protect this ingress queue.
+const maxQueuedLogBytes int64 = 32 * 1024 * 1024
+
 // Read-only store
 type RStore interface {
 	Dispatch(action Action)
@@ -29,15 +35,24 @@ type RStore interface {
 // https://redux.js.org/introduction/threeprinciples
 // https://redux.js.org/basics
 type Store struct {
-	sleeper     Sleeper
-	state       *EngineState
-	subscribers *subscriberList
-	actionQueue *actionQueue
-	actionCh    chan []Action
-	mu          sync.Mutex
-	stateMu     sync.RWMutex
-	reduce      Reducer
-	logActions  bool
+	sleeper         Sleeper
+	state           *EngineState
+	subscribers     *subscriberList
+	actionQueue     []Action
+	actionCh        chan []Action
+	actionReady     chan struct{}
+	mu              sync.Mutex
+	logBudget       *sync.Cond
+	closedStore     bool
+	closeOnce       sync.Once
+	workerCtx       context.Context
+	cancelWorker    context.CancelFunc
+	workerStopped   bool
+	workerStartOnce sync.Once
+	workerStopOnce  sync.Once
+	stateMu         sync.RWMutex
+	reduce          Reducer
+	logActions      bool
 
 	// queuedLogBytes is observability for log payloads accepted by Dispatch
 	// but not yet reduced.
@@ -51,15 +66,20 @@ type Store struct {
 }
 
 func NewStore(reducer Reducer, logActions LogActionsFlag) *Store {
-	return &Store{
-		sleeper:     DefaultSleeper(),
-		state:       NewState(),
-		reduce:      reducer,
-		actionQueue: &actionQueue{},
-		actionCh:    make(chan []Action),
-		subscribers: &subscriberList{},
-		logActions:  bool(logActions),
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	s := &Store{
+		sleeper:      DefaultSleeper(),
+		state:        NewState(),
+		reduce:       reducer,
+		actionCh:     make(chan []Action),
+		actionReady:  make(chan struct{}, 1),
+		subscribers:  &subscriberList{},
+		logActions:   bool(logActions),
+		workerCtx:    workerCtx,
+		cancelWorker: cancelWorker,
 	}
+	s.logBudget = sync.NewCond(&s.mu)
+	return s
 }
 
 // Returns a Store with a fake reducer that saves observed actions and makes
@@ -130,10 +150,41 @@ func (s *Store) UnlockMutableState() {
 }
 
 func (s *Store) Dispatch(action Action) {
-	s.queuedLogBytes.Add(logActionPayloadBytes(action))
-	s.actionQueue.add(action)
-	s.drainStarts.Add(1)
-	go s.drainActions()
+	logBytes := logActionPayloadBytes(action)
+
+	s.mu.Lock()
+	// A Store reducer can itself log. Waiting only after the queue is already
+	// over the limit admits that in-flight dispatch instead of deadlocking the
+	// reducer. This is a soft cap: it can exceed maxQueuedLogBytes by one log
+	// payload, but every later producer blocks until reduction makes room.
+	for logBytes > 0 && s.queuedLogBytes.Load() > maxQueuedLogBytes && !s.closedStore && !s.workerStopped {
+		s.logBudget.Wait()
+	}
+	if s.closedStore || s.workerStopped {
+		s.mu.Unlock()
+		return
+	}
+	s.queuedLogBytes.Add(logBytes)
+	s.actionQueue = append(s.actionQueue, action)
+	s.workerStartOnce.Do(func() {
+		go s.drainActions()
+	})
+	s.mu.Unlock()
+
+	select {
+	case s.actionReady <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Store) stopDrainWorker() {
+	s.workerStopOnce.Do(func() {
+		s.mu.Lock()
+		s.workerStopped = true
+		s.logBudget.Broadcast()
+		s.mu.Unlock()
+		s.cancelWorker()
+	})
 }
 
 // QueuedLogBytesForTesting reports the payload bytes that have been accepted
@@ -142,13 +193,27 @@ func (s *Store) QueuedLogBytesForTesting() int64 {
 	return s.queuedLogBytes.Load()
 }
 
-// DrainStartsForTesting reports the drain goroutines that Dispatch has started.
+// DrainStartsForTesting reports the long-lived drain workers that have started.
 func (s *Store) DrainStartsForTesting() int64 {
 	return s.drainStarts.Load()
 }
 
 func (s *Store) Close() {
-	close(s.actionCh)
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closedStore = true
+		s.logBudget.Broadcast()
+		if !s.workerStopped {
+			s.workerStartOnce.Do(func() {
+				go s.drainActions()
+			})
+		}
+		s.mu.Unlock()
+		select {
+		case s.actionReady <- struct{}{}:
+		default:
+		}
+	})
 }
 
 func (s *Store) SetUpSubscribersForTesting(ctx context.Context) error {
@@ -161,6 +226,7 @@ func (s *Store) Loop(ctx context.Context) error {
 		return err
 	}
 	defer s.subscribers.TeardownAll(context.Background())
+	defer s.stopDrainWorker()
 
 	// Set up a defer handler, and make sure to unlock the state
 	// if the control loop is interrupted by a panic.
@@ -178,7 +244,10 @@ func (s *Store) Loop(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 
-		case actions := <-s.actionCh:
+		case actions, ok := <-s.actionCh:
+			if !ok {
+				return nil
+			}
 			s.stateMu.Lock()
 			hasStateLock = true
 
@@ -191,7 +260,13 @@ func (s *Store) Loop(ctx context.Context) error {
 				}
 
 				s.reduce(ctx, s.state, action)
-				s.queuedLogBytes.Add(-logActionPayloadBytes(action))
+				logBytes := logActionPayloadBytes(action)
+				if logBytes > 0 {
+					s.mu.Lock()
+					s.queuedLogBytes.Add(-logBytes)
+					s.logBudget.Broadcast()
+					s.mu.Unlock()
+				}
 
 				if summarizer, ok := action.(Summarizer); ok {
 					summarizer.Summarize(&summary)
@@ -269,40 +344,47 @@ func (s *Store) maybeFinished() (bool, error) {
 }
 
 func (s *Store) drainActions() {
-	s.sleeper.Sleep(context.Background(), actionBatchWindow)
+	s.drainStarts.Add(1)
+	for {
+		// Coalesce a burst so the established batching window is retained while
+		// a single worker preserves action order without a goroutine per dispatch.
+		select {
+		case <-s.actionReady:
+		case <-s.workerCtx.Done():
+			return
+		}
+		s.sleeper.Sleep(s.workerCtx, actionBatchWindow)
+		if s.workerCtx.Err() != nil {
+			return
+		}
 
-	// The mutex here ensures that the actions appear on the channel in-order.
-	// Otherwise, two drains can interleave badly.
-	s.mu.Lock()
-	defer s.mu.Unlock()
+		s.mu.Lock()
+		actions := s.actionQueue
+		s.actionQueue = nil
+		closed := s.closedStore
+		s.mu.Unlock()
 
-	actions := s.actionQueue.drain()
-	if len(actions) > 0 {
-		s.actionCh <- actions
+		if len(actions) > 0 {
+			select {
+			case s.actionCh <- actions:
+			case <-s.workerCtx.Done():
+				return
+			}
+		}
+
+		s.mu.Lock()
+		closed = closed || s.closedStore
+		empty := len(s.actionQueue) == 0
+		s.mu.Unlock()
+		if closed && empty {
+			close(s.actionCh)
+			return
+		}
 	}
 }
 
 type Action interface {
 	Action()
-}
-
-type actionQueue struct {
-	actions []Action
-	mu      sync.Mutex
-}
-
-func (q *actionQueue) add(action Action) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.actions = append(q.actions, action)
-}
-
-func (q *actionQueue) drain() []Action {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	result := append([]Action{}, q.actions...)
-	q.actions = nil
-	return result
 }
 
 type LogActionsFlag bool
