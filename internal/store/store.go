@@ -43,8 +43,8 @@ type Store struct {
 	// but not yet reduced.
 	queuedLogBytes atomic.Int64
 
-	// activeDrains is observability for drain goroutines currently in flight.
-	activeDrains atomic.Int64
+	// drainStarts is observability for drain goroutines started by Dispatch.
+	drainStarts atomic.Int64
 
 	// TODO(nick): Define Subscribers and Reducers.
 	// The actionChan is an intermediate representation to make the transition easier.
@@ -132,6 +132,7 @@ func (s *Store) UnlockMutableState() {
 func (s *Store) Dispatch(action Action) {
 	s.queuedLogBytes.Add(logActionPayloadBytes(action))
 	s.actionQueue.add(action)
+	s.drainStarts.Add(1)
 	go s.drainActions()
 }
 
@@ -141,9 +142,9 @@ func (s *Store) QueuedLogBytesForTesting() int64 {
 	return s.queuedLogBytes.Load()
 }
 
-// ActiveDrainsForTesting reports the number of drain goroutines currently in flight.
-func (s *Store) ActiveDrainsForTesting() int64 {
-	return s.activeDrains.Load()
+// DrainStartsForTesting reports the drain goroutines that Dispatch has started.
+func (s *Store) DrainStartsForTesting() int64 {
+	return s.drainStarts.Load()
 }
 
 func (s *Store) Close() {
@@ -268,9 +269,6 @@ func (s *Store) maybeFinished() (bool, error) {
 }
 
 func (s *Store) drainActions() {
-	s.activeDrains.Add(1)
-	defer s.activeDrains.Add(-1)
-
 	s.sleeper.Sleep(context.Background(), actionBatchWindow)
 
 	// The mutex here ensures that the actions appear on the channel in-order.
