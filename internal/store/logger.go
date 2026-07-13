@@ -16,14 +16,25 @@ import (
 func NewLogActionLogger(ctx context.Context, dispatch func(action Action)) logger.Logger {
 	l := logger.Get(ctx)
 	return logger.NewFuncLogger(l.SupportsColor(), l.Level(), func(level logger.Level, fields logger.Fields, b []byte) error {
-		action := NewGlobalLogAction(level, b)
-		// This logger is installed in the Store's reducer context. Its dispatch
-		// must never wait for pre-reducer capacity, because the reducer itself
-		// releases that capacity as it consumes actions.
-		action.nonBlockingIngress = true
-		dispatch(action)
+		dispatch(NewGlobalLogAction(level, b))
 		return nil
 	})
+}
+
+// nonBlockingGlobalLogWriter is installed only on the context passed to a
+// Store reducer. A reducer can log while it is responsible for draining this
+// ingress, so waiting for capacity there would deadlock the control loop. The
+// process-wide logger intentionally does not use this writer: external log
+// producers must apply backpressure.
+type nonBlockingGlobalLogWriter struct {
+	store *Store
+}
+
+func (w nonBlockingGlobalLogWriter) Write(level logger.Level, fields logger.Fields, p []byte) error {
+	action := NewGlobalLogAction(level, p)
+	action.nonBlockingIngress = true
+	w.store.Dispatch(action)
+	return nil
 }
 
 // Read labels and annotations of the given API object to determine where to log,

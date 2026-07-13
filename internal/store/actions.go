@@ -31,9 +31,8 @@ type LogAction struct {
 	msg       []byte
 	level     logger.Level
 
-	// nonBlockingIngress marks log actions emitted through the Store's logger.
-	// The logger is invoked by reducers, so waiting for ingress capacity there
-	// would deadlock the reducer that releases that capacity.
+	// nonBlockingIngress marks log actions emitted by the Store's reducer
+	// context. A reducer must not wait for capacity that only it can release.
 	nonBlockingIngress bool
 }
 

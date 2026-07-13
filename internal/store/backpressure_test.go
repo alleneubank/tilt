@@ -258,10 +258,10 @@ func TestLogBudgetDoesNotBlockControlOrReducerDispatch(t *testing.T) {
 		}
 		close(started)
 		<-releaseReducer
-		// NewLogActionLogger is the actual reducer-context path installed by the
-		// CLI. It must bypass budget waiting even when an external payload has
-		// already pushed the ingress above its soft cap.
-		NewLogActionLogger(ctx, store.Dispatch).Write(logger.InfoLvl, payload)
+		// Loop wraps reducer contexts with the only non-blocking log handler.
+		// The root NewLogActionLogger remains blocking so external producers
+		// cannot bypass the budget.
+		logger.Get(ctx).Write(logger.InfoLvl, payload)
 		close(reducerLogReturned)
 	}), false)
 
@@ -275,6 +275,21 @@ func TestLogBudgetDoesNotBlockControlOrReducerDispatch(t *testing.T) {
 	store.Dispatch(logActionWithPayload(payload)) // admit the soft-cap overage
 	require.Equal(t, maxQueuedLogBytes+int64(len(payload)), store.QueuedLogBytesForTesting())
 
+	// The CLI uses this logger as its process-wide root logger. It is an
+	// external producer, so it must wait for the same capacity as direct
+	// Dispatch callers rather than inheriting the reducer-only bypass.
+	externalLogReturned := make(chan struct{})
+	externalLogger := NewLogActionLogger(ctx, store.Dispatch)
+	go func() {
+		externalLogger.Write(logger.InfoLvl, payload)
+		close(externalLogReturned)
+	}()
+	select {
+	case <-externalLogReturned:
+		t.Fatal("the root logger bypassed the exhausted ingress budget")
+	case <-time.After(50 * time.Millisecond):
+	}
+
 	controlReturned := make(chan struct{})
 	go func() {
 		store.Dispatch(CompletedBuildAction{})
@@ -284,6 +299,58 @@ func TestLogBudgetDoesNotBlockControlOrReducerDispatch(t *testing.T) {
 
 	close(releaseReducer)
 	receive(t, reducerLogReturned, "a reducer-originated log dispatch to return")
+	receive(t, externalLogReturned, "the root logger to unblock after reduction")
+	store.Close()
+	require.NoError(t, receive(t, loopDone, "the closed store loop to stop"))
+}
+
+func TestLogBudgetReleaseBeforeStateLockUnblocksReadLockedDispatcher(t *testing.T) {
+	payload := make([]byte, logActionPayloadSize)
+	loopDone := make(chan error, 1)
+	store := NewStore(Reducer(func(ctx context.Context, state *EngineState, action Action) {}), false)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { loopDone <- store.Loop(ctx) }()
+
+	// Gate the worker's actionCh send so the queue reaches the byte budget
+	// before Loop can receive and release it.
+	store.mu.Lock()
+	readerLocked := make(chan struct{})
+	dispatchStarted := make(chan struct{})
+	dispatchReturned := make(chan struct{})
+	releaseReader := make(chan struct{})
+	readerDone := make(chan struct{})
+	go func() {
+		store.RLockState()
+		close(readerLocked)
+		<-dispatchStarted
+		store.Dispatch(logActionWithPayload(payload))
+		close(dispatchReturned)
+		<-releaseReader
+		store.RUnlockState()
+		close(readerDone)
+	}()
+	receive(t, readerLocked, "the reader to hold the state lock")
+
+	fillLogBudget(t, store, payload)
+	store.Dispatch(logActionWithPayload(payload)) // admit the soft-cap overage
+	close(dispatchStarted)
+
+	select {
+	case <-dispatchReturned:
+		t.Fatal("log dispatch returned while the ingress budget was exhausted")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// The receive releases the budget before Loop waits for the state write
+	// lock. The reader therefore completes its dispatch while still holding the
+	// lock that would otherwise form the deadlock triangle.
+	store.mu.Unlock()
+	receive(t, dispatchReturned, "the read-locked log dispatch to unblock")
+	close(releaseReader)
+	receive(t, readerDone, "the reader to release the state lock")
+
 	store.Close()
 	require.NoError(t, receive(t, loopDone, "the closed store loop to stop"))
 }

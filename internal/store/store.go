@@ -236,6 +236,14 @@ func (s *Store) Loop(ctx context.Context) error {
 	defer s.subscribers.TeardownAll(context.Background())
 	defer s.stopDrainWorker()
 
+	// Only reducers receive a non-blocking log handler. NewLogActionLogger is
+	// also installed as the CLI's root logger, so marking its actions specially
+	// would let every external producer bypass ingress backpressure.
+	loopCtx := ctx
+	if ctx.Value(logger.LoggerContextKey) != nil {
+		loopCtx = logger.CtxWithLogHandler(ctx, nonBlockingGlobalLogWriter{store: s})
+	}
+
 	// Set up a defer handler, and make sure to unlock the state
 	// if the control loop is interrupted by a panic.
 	hasStateLock := false
@@ -256,6 +264,11 @@ func (s *Store) Loop(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
+			// Release capacity as soon as the drain worker hands the batch to the
+			// control loop, before taking stateMu. A subscriber can hold a read
+			// lock while dispatching a log action; releasing after stateMu would
+			// create a lock triangle that prevents the reducer from ever running.
+			s.releaseQueuedLogBytes(actions)
 			s.stateMu.Lock()
 			hasStateLock = true
 
@@ -267,14 +280,7 @@ func (s *Store) Loop(ctx context.Context) error {
 					oldState = s.cheapCopyState()
 				}
 
-				s.reduce(ctx, s.state, action)
-				logBytes := logActionPayloadBytes(action)
-				if logBytes > 0 {
-					s.ingressMu.Lock()
-					s.queuedLogBytes.Add(-logBytes)
-					s.logBudget.Broadcast()
-					s.ingressMu.Unlock()
-				}
+				s.reduce(loopCtx, s.state, action)
 
 				if summarizer, ok := action.(Summarizer); ok {
 					summarizer.Summarize(&summary)
@@ -311,6 +317,21 @@ func (s *Store) Loop(ctx context.Context) error {
 		}
 		s.NotifySubscribers(ctx, summary)
 	}
+}
+
+func (s *Store) releaseQueuedLogBytes(actions []Action) {
+	var released int64
+	for _, action := range actions {
+		released += logActionPayloadBytes(action)
+	}
+	if released == 0 {
+		return
+	}
+
+	s.ingressMu.Lock()
+	s.queuedLogBytes.Add(-released)
+	s.logBudget.Broadcast()
+	s.ingressMu.Unlock()
 }
 
 func logActionPayloadBytes(action Action) int64 {
@@ -384,11 +405,16 @@ func (s *Store) drainActions() {
 		s.ingressMu.Unlock()
 
 		if len(actions) > 0 {
+			// mu gates the hand-off to the control loop. Callers and tests use it
+			// to make a burst one broadcast; Dispatch must not take this mutex.
+			s.mu.Lock()
 			select {
 			case s.actionCh <- actions:
 			case <-s.workerCtx.Done():
+				s.mu.Unlock()
 				return
 			}
+			s.mu.Unlock()
 		}
 
 		s.ingressMu.Lock()
