@@ -16,7 +16,12 @@ import (
 func NewLogActionLogger(ctx context.Context, dispatch func(action Action)) logger.Logger {
 	l := logger.Get(ctx)
 	return logger.NewFuncLogger(l.SupportsColor(), l.Level(), func(level logger.Level, fields logger.Fields, b []byte) error {
-		dispatch(NewGlobalLogAction(level, b))
+		action := NewGlobalLogAction(level, b)
+		// This logger is installed in the Store's reducer context. Its dispatch
+		// must never wait for pre-reducer capacity, because the reducer itself
+		// releases that capacity as it consumes actions.
+		action.nonBlockingIngress = true
+		dispatch(action)
 		return nil
 	})
 }

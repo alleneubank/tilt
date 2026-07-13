@@ -35,19 +35,23 @@ type RStore interface {
 // https://redux.js.org/introduction/threeprinciples
 // https://redux.js.org/basics
 type Store struct {
-	sleeper         Sleeper
-	state           *EngineState
-	subscribers     *subscriberList
-	actionQueue     []Action
-	actionCh        chan []Action
-	actionReady     chan struct{}
-	mu              sync.Mutex
+	sleeper     Sleeper
+	state       *EngineState
+	subscribers *subscriberList
+	actionQueue []Action
+	actionCh    chan []Action
+	actionReady chan struct{}
+	// ingressMu exclusively protects ingress state. Dispatch deliberately does
+	// not take mu: Store tests and callers use mu to coordinate broadcasting,
+	// and making enqueue contend on it can deadlock a dispatcher.
+	ingressMu       sync.Mutex
 	logBudget       *sync.Cond
 	closedStore     bool
+	workerStopped   bool
+	mu              sync.Mutex
 	closeOnce       sync.Once
 	workerCtx       context.Context
 	cancelWorker    context.CancelFunc
-	workerStopped   bool
 	workerStartOnce sync.Once
 	workerStopOnce  sync.Once
 	stateMu         sync.RWMutex
@@ -78,7 +82,7 @@ func NewStore(reducer Reducer, logActions LogActionsFlag) *Store {
 		workerCtx:    workerCtx,
 		cancelWorker: cancelWorker,
 	}
-	s.logBudget = sync.NewCond(&s.mu)
+	s.logBudget = sync.NewCond(&s.ingressMu)
 	return s
 }
 
@@ -152,16 +156,20 @@ func (s *Store) UnlockMutableState() {
 func (s *Store) Dispatch(action Action) {
 	logBytes := logActionPayloadBytes(action)
 
-	s.mu.Lock()
-	// A Store reducer can itself log. Waiting only after the queue is already
-	// over the limit admits that in-flight dispatch instead of deadlocking the
-	// reducer. This is a soft cap: it can exceed maxQueuedLogBytes by one log
-	// payload, but every later producer blocks until reduction makes room.
-	for logBytes > 0 && s.queuedLogBytes.Load() > maxQueuedLogBytes && !s.closedStore && !s.workerStopped {
+	s.ingressMu.Lock()
+	// Logger actions are dispatched from the reducer's context. They must never
+	// wait for bytes that only that reducer can release, or a full ingress queue
+	// would deadlock the control loop. They still count toward the budget, which
+	// makes external log producers apply backpressure until the reducer catches up.
+	//
+	// External producers use a soft limit: the payload that crosses the cap is
+	// admitted, then later producers wait. This bounds overshoot to one external
+	// payload without dropping any logs.
+	for logBytes > 0 && !logActionBypassesBudget(action) && s.queuedLogBytes.Load() > maxQueuedLogBytes && !s.closedStore && !s.workerStopped {
 		s.logBudget.Wait()
 	}
 	if s.closedStore || s.workerStopped {
-		s.mu.Unlock()
+		s.ingressMu.Unlock()
 		return
 	}
 	s.queuedLogBytes.Add(logBytes)
@@ -169,7 +177,7 @@ func (s *Store) Dispatch(action Action) {
 	s.workerStartOnce.Do(func() {
 		go s.drainActions()
 	})
-	s.mu.Unlock()
+	s.ingressMu.Unlock()
 
 	select {
 	case s.actionReady <- struct{}{}:
@@ -179,10 +187,10 @@ func (s *Store) Dispatch(action Action) {
 
 func (s *Store) stopDrainWorker() {
 	s.workerStopOnce.Do(func() {
-		s.mu.Lock()
+		s.ingressMu.Lock()
 		s.workerStopped = true
 		s.logBudget.Broadcast()
-		s.mu.Unlock()
+		s.ingressMu.Unlock()
 		s.cancelWorker()
 	})
 }
@@ -200,7 +208,7 @@ func (s *Store) DrainStartsForTesting() int64 {
 
 func (s *Store) Close() {
 	s.closeOnce.Do(func() {
-		s.mu.Lock()
+		s.ingressMu.Lock()
 		s.closedStore = true
 		s.logBudget.Broadcast()
 		if !s.workerStopped {
@@ -208,7 +216,7 @@ func (s *Store) Close() {
 				go s.drainActions()
 			})
 		}
-		s.mu.Unlock()
+		s.ingressMu.Unlock()
 		select {
 		case s.actionReady <- struct{}{}:
 		default:
@@ -262,10 +270,10 @@ func (s *Store) Loop(ctx context.Context) error {
 				s.reduce(ctx, s.state, action)
 				logBytes := logActionPayloadBytes(action)
 				if logBytes > 0 {
-					s.mu.Lock()
+					s.ingressMu.Lock()
 					s.queuedLogBytes.Add(-logBytes)
 					s.logBudget.Broadcast()
-					s.mu.Unlock()
+					s.ingressMu.Unlock()
 				}
 
 				if summarizer, ok := action.(Summarizer); ok {
@@ -316,6 +324,17 @@ func logActionPayloadBytes(action Action) int64 {
 	}
 }
 
+func logActionBypassesBudget(action Action) bool {
+	switch action := action.(type) {
+	case LogAction:
+		return action.nonBlockingIngress
+	case *LogAction:
+		return action.nonBlockingIngress
+	default:
+		return false
+	}
+}
+
 func (s *Store) maybeFinished() (bool, error) {
 	state := s.RLockState()
 	defer s.RUnlockState()
@@ -358,11 +377,11 @@ func (s *Store) drainActions() {
 			return
 		}
 
-		s.mu.Lock()
+		s.ingressMu.Lock()
 		actions := s.actionQueue
 		s.actionQueue = nil
 		closed := s.closedStore
-		s.mu.Unlock()
+		s.ingressMu.Unlock()
 
 		if len(actions) > 0 {
 			select {
@@ -372,10 +391,10 @@ func (s *Store) drainActions() {
 			}
 		}
 
-		s.mu.Lock()
+		s.ingressMu.Lock()
 		closed = closed || s.closedStore
 		empty := len(s.actionQueue) == 0
-		s.mu.Unlock()
+		s.ingressMu.Unlock()
 		if closed && empty {
 			close(s.actionCh)
 			return

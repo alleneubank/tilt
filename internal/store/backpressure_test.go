@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"io"
 	"runtime"
 	"testing"
 	"time"
@@ -257,17 +258,22 @@ func TestLogBudgetDoesNotBlockControlOrReducerDispatch(t *testing.T) {
 		}
 		close(started)
 		<-releaseReducer
-		store.Dispatch(logActionWithPayload(payload))
+		// NewLogActionLogger is the actual reducer-context path installed by the
+		// CLI. It must bypass budget waiting even when an external payload has
+		// already pushed the ingress above its soft cap.
+		NewLogActionLogger(ctx, store.Dispatch).Write(logger.InfoLvl, payload)
 		close(reducerLogReturned)
 	}), false)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(logger.WithLogger(context.Background(), logger.NewTestLogger(io.Discard)))
 	defer cancel()
 	go func() { loopDone <- store.Loop(ctx) }()
 
 	store.Dispatch(reducerDispatchAction{})
 	receive(t, started, "the reducer to stall")
 	fillLogBudget(t, store, payload)
+	store.Dispatch(logActionWithPayload(payload)) // admit the soft-cap overage
+	require.Equal(t, maxQueuedLogBytes+int64(len(payload)), store.QueuedLogBytesForTesting())
 
 	controlReturned := make(chan struct{})
 	go func() {
