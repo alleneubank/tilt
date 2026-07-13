@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
@@ -37,6 +38,13 @@ type Store struct {
 	stateMu     sync.RWMutex
 	reduce      Reducer
 	logActions  bool
+
+	// queuedLogBytes is observability for log payloads accepted by Dispatch
+	// but not yet reduced.
+	queuedLogBytes atomic.Int64
+
+	// activeDrains is observability for drain goroutines currently in flight.
+	activeDrains atomic.Int64
 
 	// TODO(nick): Define Subscribers and Reducers.
 	// The actionChan is an intermediate representation to make the transition easier.
@@ -122,8 +130,20 @@ func (s *Store) UnlockMutableState() {
 }
 
 func (s *Store) Dispatch(action Action) {
+	s.queuedLogBytes.Add(logActionPayloadBytes(action))
 	s.actionQueue.add(action)
 	go s.drainActions()
+}
+
+// QueuedLogBytesForTesting reports the payload bytes that have been accepted
+// by Dispatch but not yet reduced.
+func (s *Store) QueuedLogBytesForTesting() int64 {
+	return s.queuedLogBytes.Load()
+}
+
+// ActiveDrainsForTesting reports the number of drain goroutines currently in flight.
+func (s *Store) ActiveDrainsForTesting() int64 {
+	return s.activeDrains.Load()
 }
 
 func (s *Store) Close() {
@@ -170,6 +190,7 @@ func (s *Store) Loop(ctx context.Context) error {
 				}
 
 				s.reduce(ctx, s.state, action)
+				s.queuedLogBytes.Add(-logActionPayloadBytes(action))
 
 				if summarizer, ok := action.(Summarizer); ok {
 					summarizer.Summarize(&summary)
@@ -208,6 +229,17 @@ func (s *Store) Loop(ctx context.Context) error {
 	}
 }
 
+func logActionPayloadBytes(action Action) int64 {
+	switch action := action.(type) {
+	case LogAction:
+		return int64(len(action.msg))
+	case *LogAction:
+		return int64(len(action.msg))
+	default:
+		return 0
+	}
+}
+
 func (s *Store) maybeFinished() (bool, error) {
 	state := s.RLockState()
 	defer s.RUnlockState()
@@ -236,6 +268,9 @@ func (s *Store) maybeFinished() (bool, error) {
 }
 
 func (s *Store) drainActions() {
+	s.activeDrains.Add(1)
+	defer s.activeDrains.Add(-1)
+
 	s.sleeper.Sleep(context.Background(), actionBatchWindow)
 
 	// The mutex here ensures that the actions appear on the channel in-order.
