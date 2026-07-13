@@ -118,6 +118,7 @@ func (c *updogCmd) run(ctx context.Context, args []string) error {
 	l := store.NewLogActionLogger(ctx, deps.Upper.Dispatch)
 	deferred.SetOutput(l)
 	ctx = redirectLogs(ctx, l)
+	ctx = store.CtxWithLoopLogger(ctx, store.NewLoopLogActionLogger(ctx, deps.Upper.Dispatch))
 
 	// A lot of these parameters don't matter because we don't have any
 	// controllers registered.

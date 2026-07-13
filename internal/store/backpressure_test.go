@@ -293,6 +293,8 @@ func TestLogBudgetDoesNotBlockControlOrReducerDispatch(t *testing.T) {
 	payload := make([]byte, logActionPayloadSize)
 	started := make(chan struct{})
 	releaseReducer := make(chan struct{})
+	loopLogDispatched := make(chan struct{})
+	allowReducerReturn := make(chan struct{})
 	reducerLogReturned := make(chan struct{})
 	loopDone := make(chan error, 1)
 	var store *Store
@@ -306,12 +308,15 @@ func TestLogBudgetDoesNotBlockControlOrReducerDispatch(t *testing.T) {
 		// The root NewLogActionLogger remains blocking so external producers
 		// cannot bypass the budget.
 		logger.Get(ctx).Write(logger.InfoLvl, payload)
+		close(loopLogDispatched)
+		<-allowReducerReturn
 		close(reducerLogReturned)
 	}), false)
 
 	baseCtx := logger.WithLogger(context.Background(), logger.NewTestLogger(io.Discard))
 	ctx, cancel := context.WithCancel(baseCtx)
 	ctx = logger.WithLogger(ctx, NewLogActionLogger(ctx, store.Dispatch))
+	ctx = CtxWithLoopLogger(ctx, NewLoopLogActionLogger(ctx, store.Dispatch))
 	defer cancel()
 	go func() { loopDone <- store.Loop(ctx) }()
 
@@ -323,7 +328,8 @@ func TestLogBudgetDoesNotBlockControlOrReducerDispatch(t *testing.T) {
 
 	// The CLI uses this logger as its process-wide root logger. It is an
 	// external producer, so it must wait for the same capacity as direct
-	// Dispatch callers rather than inheriting the reducer-only bypass.
+	// Dispatch callers. The loop logger's action-scoped exemption cannot leak
+	// to this concurrent dispatch.
 	externalLogReturned := make(chan struct{})
 	externalLogger := NewLogActionLogger(ctx, store.Dispatch)
 	go func() {
@@ -344,6 +350,13 @@ func TestLogBudgetDoesNotBlockControlOrReducerDispatch(t *testing.T) {
 	receive(t, controlReturned, "a control action to bypass the log budget")
 
 	close(releaseReducer)
+	receive(t, loopLogDispatched, "the reducer's loop logger to dispatch its exempt action")
+	select {
+	case <-externalLogReturned:
+		t.Fatal("an external log dispatch bypassed the loop logger's action-scoped exemption")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(allowReducerReturn)
 	receive(t, reducerLogReturned, "a reducer-originated log dispatch to return")
 	receive(t, externalLogReturned, "the root logger to unblock after reduction")
 	store.Close()

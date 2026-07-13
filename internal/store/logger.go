@@ -21,23 +21,17 @@ func NewLogActionLogger(ctx context.Context, dispatch func(action Action)) logge
 	})
 }
 
-// nonBlockingLogWriter wraps only the context passed to Store reducers. It
-// preserves the existing handler's routing, while making a synchronous
-// Dispatch inside that handler safe when the reducer has exhausted ingress.
-// The process-wide logger remains blocking for all external producers.
-type nonBlockingLogWriter struct {
-	store          *Store
-	previousLogger logger.Logger
-}
-
-func (w nonBlockingLogWriter) Write(level logger.Level, fields logger.Fields, p []byte) error {
-	w.store.loopLogWriteInProgress.Add(1)
-	defer w.store.loopLogWriteInProgress.Add(-1)
-
-	// WithFields preserves fields supplied by the wrapper logger before
-	// forwarding the exact level and payload to the context's prior route.
-	w.previousLogger.WithFields(fields).Write(level, p)
-	return nil
+// NewLoopLogActionLogger creates the logger installed only on the context
+// handed to Store reducers. Its actions carry their own ingress exemption, so
+// concurrent external writes cannot observe or borrow that exemption.
+func NewLoopLogActionLogger(ctx context.Context, dispatch func(action Action)) logger.Logger {
+	l := logger.Get(ctx)
+	return logger.NewFuncLogger(l.SupportsColor(), l.Level(), func(level logger.Level, fields logger.Fields, b []byte) error {
+		action := NewGlobalLogAction(level, b)
+		action.nonBlockingIngress = true
+		dispatch(action)
+		return nil
+	})
 }
 
 // Read labels and annotations of the given API object to determine where to log,
