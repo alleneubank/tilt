@@ -193,6 +193,129 @@ describe("LogStore", () => {
     )
   })
 
+  it("reads bounded chronological tails without materializing preceding lines", () => {
+    let logs = new LogStore()
+    let segments: LogSegment[] = []
+    for (let i = 0; i < 100; i++) {
+      segments.push({
+        spanId: i % 2 === 0 ? "fe" : "be",
+        text: `line ${i}\n`,
+        time: now(),
+      })
+    }
+    logs.append({
+      spans: {
+        fe: { manifestName: "fe" },
+        be: { manifestName: "be" },
+        empty: { manifestName: "empty" },
+      },
+      segments,
+      fromCheckpoint: 0,
+      toCheckpoint: segments.length,
+    })
+
+    let allTail = logs.allLogTailPatchSet(3)
+    expect(allTail.checkpoint).toEqual(segments.length)
+    expect(allTail.lines.map((line) => line.text)).toEqual([
+      "line 97",
+      "line 98",
+      "line 99",
+    ])
+    expect(Object.keys(logs.lineCache)).toHaveLength(3)
+
+    let manifestTail = logs.manifestLogTailPatchSet("fe", 3)
+    expect(manifestTail.lines.map((line) => line.storedLineIndex)).toEqual([
+      94, 96, 98,
+    ])
+    expect(manifestTail.lines.map((line) => line.text)).toEqual([
+      "line 94",
+      "line 96",
+      "line 98",
+    ])
+
+    let starredTail = logs.starredLogTailPatchSet(["be"], 2)
+    expect(starredTail.lines.map((line) => line.storedLineIndex)).toEqual([
+      97, 99,
+    ])
+    expect(logs.manifestLogTailPatchSet("empty", 3)).toEqual({
+      lines: [],
+      checkpoint: segments.length,
+    })
+    expect(logs.starredLogTailPatchSet([], 3)).toEqual({
+      lines: [],
+      checkpoint: segments.length,
+    })
+  })
+
+  it("returns nonempty filtered tails shorter than their limit", () => {
+    let logs = new LogStore()
+    logs.append({
+      spans: { "": {}, fe: { manifestName: "fe" } },
+      segments: [
+        newGlobalSegment("before\n"),
+        newManifestSegment("fe", "only fe line\n"),
+        newGlobalSegment("after\n"),
+      ],
+      fromCheckpoint: 0,
+      toCheckpoint: 3,
+    })
+
+    let tail = logs.manifestLogTailPatchSet("fe", 3)
+    expect(tail.checkpoint).toEqual(3)
+    expect(tail.lines.map((line) => [line.storedLineIndex, line.text])).toEqual(
+      [[1, "only fe line"]]
+    )
+  })
+
+  it("keeps tail progress rewrites current and rejects invalid limits", () => {
+    let logs = new LogStore()
+    logs.append({
+      spans: { fe: { manifestName: "fe" } },
+      segments: [
+        {
+          spanId: "fe",
+          text: "progress pending\n",
+          time: now(),
+          fields: { progressID: "build" },
+        },
+      ],
+      fromCheckpoint: 0,
+      toCheckpoint: 1,
+    })
+    logs.append({
+      spans: { fe: { manifestName: "fe" } },
+      segments: [
+        {
+          spanId: "fe",
+          text: "progress complete\n",
+          time: now(),
+          fields: { progressID: "build" },
+        },
+        { spanId: "fe", text: "newer line\n", time: now() },
+      ],
+      fromCheckpoint: 1,
+      toCheckpoint: 3,
+    })
+
+    let tail = logs.manifestLogTailPatchSet("fe", 2)
+    expect(tail.lines.map((line) => [line.storedLineIndex, line.text])).toEqual(
+      [
+        [0, "progress complete"],
+        [1, "newer line"],
+      ]
+    )
+    expect(logs.manifestLogPatchSet("fe", tail.checkpoint)).toEqual({
+      lines: [],
+      checkpoint: 3,
+    })
+    expect(() => logs.allLogTailPatchSet(0)).toThrow(
+      "Tail log limit must be a positive safe integer"
+    )
+    expect(() => logs.allLogTailPatchSet(-1)).toThrow(
+      "Tail log limit must be a positive safe integer"
+    )
+  })
+
   it("handles progressLogs interleaved", () => {
     let logs = new LogStore()
     logs.append({
@@ -565,6 +688,11 @@ describe("LogStore", () => {
 
     expect(logLinesToString(logs.allLog(), true)).toEqual(
       "fe          ┊ build 1\nbe          ┊ build 7\nglobal line 1"
+    )
+    let tail = logs.manifestLogTailPatchSet("be", 2)
+    expect(tail.checkpoint).toEqual(3)
+    expect(tail.lines.map((line) => [line.storedLineIndex, line.text])).toEqual(
+      [[1, "build 7"]]
     )
   })
 

@@ -386,6 +386,13 @@ class LogStore implements LogAlertIndex {
     return this.logHelper(this.spans, checkpoint)
   }
 
+  // Read the newest stored lines without first materializing the complete log.
+  // This is intentionally a checkpoint-zero snapshot: callers use it to mount
+  // a compact follow-mode tail, then use the ordinary patch API for updates.
+  allLogTailPatchSet(limit: number): LogPatchSet {
+    return this.tailLogHelper(this.spans, limit)
+  }
+
   spanLog(spanIds: string[]): LogLine[] {
     let spans: { [key: string]: LogSpan } = {}
     spanIds.forEach((spanId) => {
@@ -516,15 +523,60 @@ class LogStore implements LogAlertIndex {
     return this.logHelper(spans, checkpoint)
   }
 
+  manifestLogTailPatchSet(mn: string, limit: number): LogPatchSet {
+    return this.tailLogHelper(this.spansForManifest(mn), limit)
+  }
+
   starredLogPatchSet(stars: string[], checkpoint: number): LogPatchSet {
+    return this.logHelper(this.spansForManifests(stars), checkpoint)
+  }
+
+  starredLogTailPatchSet(stars: string[], limit: number): LogPatchSet {
+    return this.tailLogHelper(this.spansForManifests(stars), limit)
+  }
+
+  private spansForManifests(manifests: string[]): {
+    [key: string]: LogSpan
+  } {
     let result: { [key: string]: LogSpan } = {}
     for (let spanId in this.spans) {
       let span = this.spans[spanId]
-      if (stars.includes(span.manifestName)) {
+      if (manifests.includes(span.manifestName)) {
         result[spanId] = span
       }
     }
-    return this.logHelper(result, checkpoint)
+    return result
+  }
+
+  private tailLogHelper(
+    spansToLog: { [key: string]: LogSpan },
+    limit: number
+  ): LogPatchSet {
+    if (!Number.isSafeInteger(limit) || limit <= 0) {
+      throw new Error(
+        `Tail log limit must be a positive safe integer, got ${limit}`
+      )
+    }
+
+    // Scan stored lines from the tail so the cache and result stay bounded by
+    // the requested window. Reverse once at the boundary to preserve the
+    // chronological identity order required by the renderer.
+    let newestFirst: LogLine[] = []
+    for (
+      let i = this.lines.length - 1;
+      i >= 0 && newestFirst.length < limit;
+      i--
+    ) {
+      let storedLine = this.lines[i]
+      let span = spansToLog[storedLine.spanId]
+      if (!span) {
+        continue
+      }
+      newestFirst.push(this.materializeLogLine(i, storedLine, span))
+    }
+
+    newestFirst.reverse()
+    return { lines: newestFirst, checkpoint: this.segments.length }
   }
 
   // Return all the logs for the given options.
@@ -618,32 +670,40 @@ class LogStore implements LogAlertIndex {
         continue
       }
 
-      let line = this.lineCache[i]
-      if (!line) {
-        let text = storedLine.text
-        // strip off the newline
-        if (text[text.length - 1] === "\n") {
-          text = text.substring(0, text.length - 1)
-        }
-        line = {
-          text: text,
-          level: storedLine.level,
-          manifestName: span.manifestName,
-          buildEvent: storedLine.fields?.buildEvent,
-          spanId: spanId,
-          storedLineIndex: i,
-        }
-
-        this.lineCache[i] = line
-      }
-
-      result.push(line)
+      result.push(this.materializeLogLine(i, storedLine, span))
     }
 
     return {
       lines: result,
       checkpoint: this.segments.length,
     }
+  }
+
+  private materializeLogLine(
+    storedLineIndex: number,
+    storedLine: StoredLine,
+    span: LogSpan
+  ): LogLine {
+    let line = this.lineCache[storedLineIndex]
+    if (line) {
+      return line
+    }
+
+    let text = storedLine.text
+    // The renderer receives a logical line without its storage delimiter.
+    if (text[text.length - 1] === "\n") {
+      text = text.substring(0, text.length - 1)
+    }
+    line = {
+      text,
+      level: storedLine.level,
+      manifestName: span.manifestName,
+      buildEvent: storedLine.fields?.buildEvent,
+      spanId: storedLine.spanId,
+      storedLineIndex,
+    }
+    this.lineCache[storedLineIndex] = line
+    return line
   }
 
   // After a log hits its limit, we need to truncate it to keep it small
