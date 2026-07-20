@@ -1,44 +1,45 @@
-import {
-  Accordion,
-  AccordionDetails,
-  AccordionSummary,
-} from "@material-ui/core"
-import React, { ChangeEvent, useCallback, useState } from "react"
+import React, {
+  useCallback,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react"
+import { flushSync } from "react-dom"
 import { Link } from "react-router-dom"
 import styled from "styled-components"
-import {
-  DEFAULT_RESOURCE_LIST_LIMIT,
-  RESOURCE_LIST_MULTIPLIER,
-} from "./constants"
-import { FeaturesContext, Flag, useFeatures } from "./feature"
-import {
-  GroupByLabelView,
-  orderLabels,
-  TILTFILE_LABEL,
-  UNLABELED_LABEL,
-} from "./labels"
+import { FeaturesContext, Flag } from "./feature"
+import { orderLabels, TILTFILE_LABEL, UNLABELED_LABEL } from "./labels"
 import { OverviewSidebarOptions } from "./OverviewSidebarOptions"
 import PathBuilder from "./PathBuilder"
 import {
-  AccordionDetailsStyleResetMixin,
-  AccordionStyleResetMixin,
-  AccordionSummaryStyleResetMixin,
   ResourceGroupsInfoTip,
   ResourceGroupSummaryIcon,
-  ResourceGroupSummaryMixin,
 } from "./ResourceGroups"
 import { useResourceGroups } from "./ResourceGroupsContext"
 import { ResourceListOptions } from "./ResourceListOptionsContext"
+import {
+  buildSidebarVirtualModel,
+  findResourceOccurrence,
+  ResourceVirtualEntry,
+  ResourceVirtualResourceEntry,
+} from "./ResourceVirtualModel"
+import { ResourceVirtualWindow } from "./ResourceVirtualWindow"
 import { matchesResourceName } from "./ResourceNameFilter"
 import { SidebarGroupStatusSummary } from "./ResourceStatusSummary"
-import { ShowMoreButton } from "./ShowMoreButton"
 import SidebarItem from "./SidebarItem"
-import SidebarItemView, {
-  sidebarItemIsDisabled,
-  SidebarItemRoot,
-} from "./SidebarItemView"
-import SidebarKeyboardShortcuts from "./SidebarKeyboardShortcuts"
-import { AnimDuration, Color, Font, FontSize, SizeUnit } from "./style-helpers"
+import SidebarItemView, { sidebarItemIsDisabled } from "./SidebarItemView"
+import SidebarKeyboardShortcuts, {
+  OccurrenceCursorRequest,
+} from "./SidebarKeyboardShortcuts"
+import {
+  AnimDuration,
+  Color,
+  Font,
+  FontSize,
+  mixinTruncateText,
+  SizeUnit,
+} from "./style-helpers"
 import { startBuild } from "./trigger"
 import { ResourceName, ResourceStatus, ResourceView } from "./types"
 import { useStarredResources } from "./StarredResourcesContext"
@@ -51,36 +52,28 @@ export type SidebarProps = {
   resourceListOptions: ResourceListOptions
 }
 
-type SidebarGroupedByProps = SidebarProps & {
-  onStartBuild: () => void
-}
-
-type SidebarSectionProps = {
-  sectionName?: string
-  groupView?: boolean
-} & SidebarProps
-
 export let SidebarResourcesRoot = styled.nav`
-  flex: 1 0 auto;
-
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
   &.isOverview {
-    overflow: auto;
     flex-shrink: 1;
   }
 `
-
-let SidebarResourcesContent = styled.div`
+const SidebarResourcesContent = styled.div`
   margin-bottom: ${SizeUnit(1.75)};
 `
-
-let SidebarListSectionName = styled.div`
-  margin-top: ${SizeUnit(0.5)};
+const SidebarListSectionName = styled.div`
+  ${mixinTruncateText};
+  box-sizing: border-box;
+  display: block;
+  max-width: 100%;
+  margin-top: 0;
   margin-left: ${SizeUnit(0.5)};
   text-transform: uppercase;
   color: ${Color.gray50};
   font-size: ${FontSize.small};
 `
-
 const BuiltinResourceLinkRoot = styled(Link)`
   background-color: ${Color.gray40};
   border: 1px solid ${Color.gray50};
@@ -94,103 +87,81 @@ const BuiltinResourceLinkRoot = styled(Link)`
   padding: ${SizeUnit(1 / 5)} ${SizeUnit(1 / 3)};
   text-decoration: none;
   transition: all ${AnimDuration.default} ease;
-
   &:is(:hover, :focus, :active) {
     background-color: ${Color.gray30};
   }
-
   &.isSelected {
     background-color: ${Color.gray70};
     color: ${Color.gray30};
     font-weight: 600;
   }
 `
-
 export const SidebarListSectionItemsRoot = styled.ul`
   margin-top: ${SizeUnit(0.25)};
   list-style: none;
 `
-
 export const SidebarDisabledSectionList = styled.li`
+  box-sizing: border-box;
   color: ${Color.gray60};
   font-family: ${Font.sansSerif};
   font-size: ${FontSize.small};
+  /* Keep the title's old vertical rhythm inside the measured root border box. */
+  padding-bottom: ${SizeUnit(1 / 12)};
+  padding-top: ${SizeUnit(1 / 3)};
 `
-
 export const SidebarDisabledSectionTitle = styled.span`
-  display: inline-block;
-  margin-bottom: ${SizeUnit(1 / 12)};
-  margin-top: ${SizeUnit(1 / 3)};
+  display: block;
   padding-left: ${SizeUnit(3 / 4)};
 `
-
 const NoMatchesFound = styled.li`
   margin-left: ${SizeUnit(0.5)};
   color: ${Color.grayLightest};
 `
+const SidebarGroupHeaderRoot = styled.li`
+  box-sizing: border-box;
+  padding: ${SizeUnit(1 / 3)} ${SizeUnit(1 / 2)};
+`
+const SidebarTiltfileHeaderRoot = styled.li`
+  box-sizing: border-box;
+  padding-top: ${SizeUnit(0.5)};
+`
+const SidebarGroupButton = styled.button`
+  background-color: ${Color.gray40};
+  border: 1px solid ${Color.gray50};
+  border-radius: ${SizeUnit(1 / 8)};
+  color: ${Color.white};
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  font-size: ${FontSize.small};
+  margin: 0;
+  width: 100%;
+  padding: ${SizeUnit(1 / 8)};
 
-const SidebarLabelSection = styled(Accordion)`
-  ${AccordionStyleResetMixin}
+  ${ResourceGroupSummaryIcon} {
+    transform: rotate(0deg);
+  }
 
-  /* Set specific margins for sidebar */
-  &.MuiAccordion-root,
-  &.MuiAccordion-root.Mui-expanded {
-    margin: ${SizeUnit(1 / 3)} ${SizeUnit(1 / 2)};
+  &[aria-expanded="true"] ${ResourceGroupSummaryIcon} {
+    transform: rotate(90deg);
   }
 `
-
-const SidebarGroupSummary = styled(AccordionSummary)`
-  ${AccordionSummaryStyleResetMixin}
-  ${ResourceGroupSummaryMixin}
-
-  /* Set specific background and borders for sidebar */
-  .MuiAccordionSummary-content {
-    background-color: ${Color.gray40};
-    border: 1px solid ${Color.gray50};
-    border-radius: ${SizeUnit(1 / 8)};
-    font-size: ${FontSize.small};
-  }
-`
-
 export const SidebarGroupName = styled.span`
+  ${mixinTruncateText};
+  min-width: 0;
   margin-right: auto;
-  overflow: hidden;
-  text-overflow: ellipsis;
   width: 100%;
 `
-
-const SidebarGroupDetails = styled(AccordionDetails)`
-  ${AccordionDetailsStyleResetMixin}
-
-  &.MuiAccordionDetails-root {
-    ${SidebarItemRoot} {
-      margin-right: unset;
-    }
-  }
-`
-
 const GROUP_INFO_TOOLTIP_ID = "sidebar-groups-info"
-
-function onlyEnabledItems(items: SidebarItem[]): SidebarItem[] {
-  return items.filter((item) => !sidebarItemIsDisabled(item))
-}
-function onlyDisabledItems(items: SidebarItem[]): SidebarItem[] {
-  return items.filter((item) => sidebarItemIsDisabled(item))
-}
-function enabledItemsFirst(items: SidebarItem[]): SidebarItem[] {
-  let result = onlyEnabledItems(items)
-  result.push(...onlyDisabledItems(items))
-  return result
-}
 
 function AllResourcesLink(props: {
   pathBuilder: PathBuilder
   selected: string
 }) {
-  const isSelectedClass = props.selected === "" ? "isSelected" : ""
   return (
     <BuiltinResourceLinkRoot
-      className={isSelectedClass}
+      className={props.selected === "" ? "isSelected" : ""}
       aria-label="View all resource logs"
       to={props.pathBuilder.encpath`/r/(all)/overview`}
     >
@@ -198,20 +169,15 @@ function AllResourcesLink(props: {
     </BuiltinResourceLinkRoot>
   )
 }
-
 function StarredResourcesLink(props: {
   pathBuilder: PathBuilder
   selected: string
 }) {
   const starContext = useStarredResources()
-  if (!starContext.starredResources.length) {
-    return null
-  }
-  const isSelectedClass =
-    props.selected === ResourceName.starred ? "isSelected" : ""
+  if (!starContext.starredResources.length) return null
   return (
     <BuiltinResourceLinkRoot
-      className={isSelectedClass}
+      className={props.selected === ResourceName.starred ? "isSelected" : ""}
       aria-label="View starred resource logs"
       to={props.pathBuilder.encpath`/r/(starred)/overview`}
     >
@@ -219,317 +185,551 @@ function StarredResourcesLink(props: {
     </BuiltinResourceLinkRoot>
   )
 }
-
-export function SidebarListSection(props: SidebarSectionProps): JSX.Element {
-  const features = useFeatures()
-  const sectionName = props.sectionName ? (
-    <SidebarListSectionName>{props.sectionName}</SidebarListSectionName>
-  ) : null
-
-  const resourceNameFilterApplied =
-    props.resourceListOptions.resourceNameFilter.length > 0
-  if (props.items.length === 0 && resourceNameFilterApplied) {
-    return (
-      <>
-        {sectionName}
-        <SidebarListSectionItemsRoot>
-          <NoMatchesFound>No matching resources</NoMatchesFound>
-        </SidebarListSectionItemsRoot>
-      </>
-    )
-  }
-
-  // TODO(nick): Figure out how to memoize filters effectively.
-  const enabledItems = onlyEnabledItems(props.items)
-  const disabledItems = onlyDisabledItems(props.items)
-
-  const displayDisabledResources = disabledItems.length > 0
-
-  return (
-    <>
-      {sectionName}
-      <SidebarListSectionItemsRoot>
-        <SidebarListSectionItems {...props} items={enabledItems} />
-
-        {displayDisabledResources && (
-          <SidebarDisabledSectionList aria-label="Disabled resources">
-            <SidebarDisabledSectionTitle>Disabled</SidebarDisabledSectionTitle>
-            <ul>
-              <SidebarListSectionItems {...props} items={disabledItems} />
-            </ul>
-          </SidebarDisabledSectionList>
-        )}
-      </SidebarListSectionItemsRoot>
-    </>
-  )
-}
-
-const ShowMoreRow = styled.li`
-  margin: ${SizeUnit(0.5)} ${SizeUnit(0.5)} 0 ${SizeUnit(0.5)};
-  display: flex;
-  align-items: center;
-  justify-content: right;
-`
-
-function SidebarListSectionItems(props: SidebarSectionProps) {
-  let [maxItems, setMaxItems] = useState(DEFAULT_RESOURCE_LIST_LIMIT)
-  let displayItems = props.items
-  let moreItems = Math.max(displayItems.length - maxItems, 0)
-  if (moreItems) {
-    displayItems = displayItems.slice(0, maxItems)
-  }
-
-  let showMore = useCallback(() => {
-    setMaxItems(maxItems * RESOURCE_LIST_MULTIPLIER)
-  }, [maxItems, setMaxItems])
-
-  let showMoreItemsButton = null
-  if (moreItems > 0) {
-    showMoreItemsButton = (
-      <ShowMoreRow>
-        <ShowMoreButton
-          onClick={showMore}
-          currentListSize={maxItems}
-          itemCount={props.items.length}
-        />
-      </ShowMoreRow>
-    )
-  }
-
-  return (
-    <>
-      {displayItems.map((item) => (
-        <SidebarItemView
-          key={"sidebarItem-" + item.name}
-          groupView={props.groupView}
-          item={item}
-          selected={props.selected === item.name}
-          pathBuilder={props.pathBuilder}
-          resourceView={props.resourceView}
-        />
-      ))}
-      {showMoreItemsButton}
-    </>
-  )
-}
-
-function SidebarGroupListSection(props: { label: string } & SidebarProps) {
-  if (props.items.length === 0) {
-    return null
-  }
-
-  const formattedLabel =
-    props.label === UNLABELED_LABEL ? <em>{props.label}</em> : props.label
-  const labelNameId = `sidebarItem-${props.label}`
-
-  const { getGroup, toggleGroupExpanded } = useResourceGroups()
-  let { expanded } = getGroup(props.label)
-
-  let isSelected = props.items.some((item) => item.name == props.selected)
-
-  if (isSelected) {
-    // If an item in the group is selected, expand the group
-    // without writing it back to persistent state.
-    //
-    // This creates a nice interaction, where if you're keyboard-navigating
-    // through sidebar items, we expand the group you navigate into and expand
-    // it when you navigate out again.
-    expanded = true
-  }
-
-  const handleChange = (_e: ChangeEvent<{}>) => toggleGroupExpanded(props.label)
-
-  // TODO (lizz): Improve the accessibility interface for accordion feature by adding focus styles
-  // according to https://www.w3.org/TR/wai-aria-practices-1.1/examples/accordion/accordion.html
-  return (
-    <SidebarLabelSection expanded={expanded} onChange={handleChange}>
-      <SidebarGroupSummary id={labelNameId}>
-        <ResourceGroupSummaryIcon role="presentation" />
-        <SidebarGroupName>{formattedLabel}</SidebarGroupName>
-        <SidebarGroupStatusSummary
-          labelText={`Status summary for ${props.label} group`}
-          resources={props.items}
-        />
-      </SidebarGroupSummary>
-      <SidebarGroupDetails aria-labelledby={labelNameId}>
-        <SidebarListSection {...props} />
-      </SidebarGroupDetails>
-    </SidebarLabelSection>
-  )
-}
-
-function resourcesLabelView(
-  items: SidebarItem[]
-): GroupByLabelView<SidebarItem> {
-  const labelsToResources: { [key: string]: SidebarItem[] } = {}
-  const unlabeled: SidebarItem[] = []
-  const tiltfile: SidebarItem[] = []
-
-  items.forEach((item) => {
-    if (item.labels.length) {
-      item.labels.forEach((label) => {
-        if (!labelsToResources.hasOwnProperty(label)) {
-          labelsToResources[label] = []
-        }
-
-        labelsToResources[label].push(item)
-      })
-    } else if (item.isTiltfile) {
-      tiltfile.push(item)
-    } else {
-      unlabeled.push(item)
-    }
-  })
-
-  // Labels are always displayed in sorted order
-  const labels = orderLabels(Object.keys(labelsToResources))
-
-  return { labels, labelsToResources, tiltfile, unlabeled }
-}
-
-function SidebarGroupedByLabels(props: SidebarGroupedByProps) {
-  const { labels, labelsToResources, tiltfile, unlabeled } = resourcesLabelView(
-    props.items
-  )
-
-  // NOTE(nick): We need the visual order of the items to pass
-  // to the keyboard navigation component. The problem is that
-  // each section component does its own ordering. So we cheat
-  // here and replicate the logic for determining the order.
-  let totalOrder: SidebarItem[] = []
-  labels.map((label) => {
-    totalOrder.push(...enabledItemsFirst(labelsToResources[label]))
-  })
-  totalOrder.push(...enabledItemsFirst(unlabeled))
-  totalOrder.push(...enabledItemsFirst(tiltfile))
-
-  return (
-    <>
-      {labels.map((label) => (
-        <SidebarGroupListSection
-          {...props}
-          key={`sidebarItem-${label}`}
-          label={label}
-          items={labelsToResources[label]}
-        />
-      ))}
-      <SidebarGroupListSection
-        {...props}
-        label={UNLABELED_LABEL}
-        items={unlabeled}
-      />
-      <SidebarListSection
-        {...props}
-        sectionName={TILTFILE_LABEL}
-        items={tiltfile}
-        groupView={true}
-      />
-      <SidebarKeyboardShortcuts
-        selected={props.selected}
-        items={totalOrder}
-        onStartBuild={props.onStartBuild}
-        resourceView={props.resourceView}
-      />
-    </>
-  )
-}
-
-function hasAlerts(item: SidebarItem): boolean {
+function hasAlerts(item: SidebarItem) {
   return item.buildAlertCount > 0 || item.runtimeAlertCount > 0
 }
-
-function sortByHasAlerts(itemA: SidebarItem, itemB: SidebarItem): number {
-  return Number(hasAlerts(itemB)) - Number(hasAlerts(itemA))
-}
-
 function applyOptionsToItems(
   items: SidebarItem[],
   options: ResourceListOptions
-): SidebarItem[] {
-  let itemsToDisplay: SidebarItem[] = [...items]
+) {
+  let result = items.filter(
+    (item) =>
+      options.showDisabledResources ||
+      item.runtimeStatus !== ResourceStatus.Disabled
+  )
+  if (options.resourceNameFilter)
+    result = result.filter((item) =>
+      matchesResourceName(item.name, options.resourceNameFilter)
+    )
+  if (options.alertsOnTop)
+    result = [...result].sort(
+      (a, b) => Number(hasAlerts(b)) - Number(hasAlerts(a))
+    )
+  return result
+}
 
-  const itemsShouldBeFiltered =
-    options.resourceNameFilter.length > 0 || !options.showDisabledResources
+type PendingOccurrence = OccurrenceCursorRequest
+type OccurrenceNavigationRequest = Extract<
+  PendingOccurrence,
+  { kind: "occurrence" }
+>
 
-  if (itemsShouldBeFiltered) {
-    itemsToDisplay = itemsToDisplay.filter((item) => {
-      const itemIsDisabled = item.runtimeStatus === ResourceStatus.Disabled
-      if (!options.showDisabledResources && itemIsDisabled) {
-        return false
+/**
+ * Resolves a request against the immutable logical projection shared by the
+ * virtual range and keyboard traversal. A vanished occurrence invalidates
+ * the request rather than inventing a cursor for a different logical row.
+ */
+function reconcileOccurrenceRequest(
+  request: OccurrenceNavigationRequest | undefined,
+  logicalResources: ReadonlyArray<ResourceVirtualResourceEntry<SidebarItem>>
+): OccurrenceNavigationRequest | undefined {
+  if (!request) return undefined
+  if (
+    logicalResources.some(
+      (entry) => entry.occurrenceKey === request.occurrenceKey
+    )
+  )
+    return request
+  return undefined
+}
+
+function SidebarVirtualList(
+  props: SidebarProps & {
+    grouped: boolean
+    tip: boolean
+    sectionName: string
+    ownerRef: React.RefObject<HTMLElement>
+    contentOriginRef: React.RefObject<HTMLUListElement>
+  }
+) {
+  const { getGroup, toggleGroupExpanded } = useResourceGroups()
+  const { starredResources } = useStarredResources()
+  // These are every known branch above the origin list with a different
+  // footprint. The window still measures the resulting origin; this merely
+  // makes a position-only chrome change observable to its layout effect.
+  const contentOriginVersion = `${props.tip}:${starredResources.length > 0}:${
+    props.grouped
+  }`
+  const groupState = useMemo(() => {
+    const state: Record<string, boolean> = {}
+    props.items.forEach((item) =>
+      item.labels.forEach((label) => {
+        state[label] = getGroup(label).expanded
+      })
+    )
+    state[UNLABELED_LABEL] = getGroup(UNLABELED_LABEL).expanded
+    state[TILTFILE_LABEL] = getGroup(TILTFILE_LABEL).expanded
+    return state
+  }, [getGroup, props.items])
+  const [navigationRequest, setNavigationRequest] = useState<
+    PendingOccurrence | undefined
+  >()
+  const nextRequestId = useRef(0)
+  // One typed request is the source of truth for mounting, route settlement,
+  // and keyboard traversal. Keyboard requests deliberately remain effective
+  // while the router is delayed; completed pointer bridges do not.
+  const navigationOwnsSelection =
+    navigationRequest &&
+    (navigationRequest.origin === "keyboard" ||
+      navigationRequest.phase === "positioning" ||
+      navigationRequest.resourceName === props.selected)
+  const effectiveSelectedName = navigationOwnsSelection
+    ? navigationRequest.resourceName
+    : props.selected
+  const model = useMemo(
+    () =>
+      buildSidebarVirtualModel<SidebarItem>({
+        items: props.items,
+        isDisabled: sidebarItemIsDisabled,
+        isTiltfile: (item) => item.isTiltfile,
+        labelsForItem: (item) => item.labels,
+        nameForItem: (item) => item.name,
+        layoutKeyForItem: (_item, section, flow) => `${section}-${flow}`,
+        sortLabels: orderLabels,
+        groupState,
+        selectedName: effectiveSelectedName,
+        grouped: props.grouped,
+      }),
+    [effectiveSelectedName, groupState, props.grouped, props.items]
+  )
+  const renderTarget = useMemo(() => {
+    if (
+      navigationRequest?.kind !== "occurrence" ||
+      navigationRequest.phase !== "positioning"
+    )
+      return undefined
+    return reconcileOccurrenceRequest(navigationRequest, model.logicalResources)
+  }, [model.logicalResources, navigationRequest, props.selected])
+  // A positioned pointer request only becomes a logical cursor once its route
+  // selects the requested resource. Keyboard requests own the cursor across a
+  // delayed route write, so repeated native traversal can compose immediately.
+  const cursorRequest =
+    navigationRequest &&
+    (navigationRequest.origin === "keyboard" ||
+      navigationRequest.resourceName === props.selected)
+      ? navigationRequest
+      : undefined
+  const previousSelectedName = useRef<string | undefined>(undefined)
+  useLayoutEffect(() => {
+    const previousSelection = previousSelectedName.current
+    const selectionChanged = previousSelection !== props.selected
+    previousSelectedName.current = props.selected
+    setNavigationRequest((current) => {
+      const selectedFallback = () => {
+        const fallback = findResourceOccurrence(
+          model.logicalResources,
+          props.selected
+        )
+        return fallback
+          ? {
+              kind: "occurrence" as const,
+              occurrenceKey: fallback.occurrenceKey,
+              resourceName: fallback.resourceName,
+              requestId: ++nextRequestId.current,
+              origin: "pointer" as const,
+              phase: "positioning" as const,
+            }
+          : undefined
       }
-
-      if (options.resourceNameFilter) {
-        return matchesResourceName(item.name, options.resourceNameFilter)
+      const currentExists =
+        current?.kind === "aggregate" ||
+        model.logicalResources.some(
+          (entry) =>
+            current?.kind === "occurrence" &&
+            entry.occurrenceKey === current.occurrenceKey
+        )
+      if (!current) return selectedFallback()
+      if (!currentExists) {
+        const currentOwnsSelection =
+          current.kind === "occurrence" &&
+          (current.origin === "keyboard" ||
+            current.phase === "positioning" ||
+            current.resourceName === props.selected)
+        const replacement = currentOwnsSelection
+          ? findResourceOccurrence(model.logicalResources, current.resourceName)
+          : undefined
+        if (replacement)
+          // Retain an owning request's identity while its projection changes.
+          // Re-enter positioning so the window mounts and focuses the exact
+          // replacement occurrence before route settlement can consume it.
+          return {
+            ...current,
+            occurrenceKey: replacement.occurrenceKey,
+            phase: "positioning",
+          }
+        // Direct route replay can settle its selected name before the next
+        // immutable projection includes that resource. When the request does
+        // not own selection, or its resource vanished entirely, use the route
+        // selection rather than inventing a cursor.
+        return selectedFallback()
       }
-
-      return true
+      // Route acknowledgement must not consume a positioning request before
+      // the virtual window has mounted and focused its exact target.
+      if (current.resourceName === props.selected)
+        return current.phase === "positioning"
+          ? current
+          : { ...current, phase: "settled" }
+      // A later route change is an external selection. Leaving a route prop
+      // stale is not a change and must preserve a keyboard-owned cursor.
+      if (selectionChanged && previousSelection !== undefined)
+        return selectedFallback()
+      return current
     })
+  }, [model.logicalResources, props.selected])
+  const onTargetMounted = useCallback(
+    (key: string, element: HTMLElement) => {
+      if (key !== renderTarget?.occurrenceKey) return
+      // Focus the resource control after the pure range has positioned its owner.
+      element.querySelector<HTMLElement>("[data-name]")?.focus()
+      setNavigationRequest((current) => {
+        if (
+          current?.kind !== "occurrence" ||
+          current.occurrenceKey !== key ||
+          current.phase !== "positioning"
+        )
+          return current
+        return {
+          ...current,
+          phase:
+            current.resourceName === props.selected
+              ? "settled"
+              : "awaiting-route",
+        }
+      })
+    },
+    [props.selected, renderTarget]
+  )
+  const requestOccurrence = useCallback(
+    (
+      entry: ResourceVirtualResourceEntry<SidebarItem>,
+      origin: OccurrenceCursorRequest["origin"] = "pointer"
+    ) => {
+      // Commit the occurrence before a route update can cause a same-name
+      // selection sync. This matters for both native keyboard listeners and
+      // mouse activation of duplicate label occurrences.
+      const request = {
+        kind: "occurrence" as const,
+        occurrenceKey: entry.occurrenceKey,
+        resourceName: entry.resourceName,
+        requestId: ++nextRequestId.current,
+        origin,
+        phase: "positioning" as const,
+      }
+      flushSync(() => {
+        setNavigationRequest(request)
+      })
+    },
+    []
+  )
+  const requestAll = useCallback(() => {
+    flushSync(() => {
+      setNavigationRequest({
+        kind: "aggregate",
+        resourceName: ResourceName.all,
+        requestId: ++nextRequestId.current,
+        origin: "keyboard",
+        phase: "settled",
+      })
+    })
+  }, [])
+  const renderEntry = (
+    entry: ResourceVirtualEntry<SidebarItem>,
+    onElement: (element: HTMLElement | null) => void
+  ) => {
+    switch (entry.kind) {
+      case "resource":
+        return (
+          <SidebarItemView
+            groupView={entry.groupId === "tiltfile"}
+            flattenedGroupView={props.grouped && entry.groupId !== "tiltfile"}
+            item={entry.item}
+            selected={props.selected === entry.resourceName}
+            pathBuilder={props.pathBuilder}
+            resourceView={props.resourceView}
+            rootRef={onElement}
+            flow={entry.flow}
+            occurrenceKey={entry.occurrenceKey}
+            onRequestOccurrence={() => requestOccurrence(entry, "pointer")}
+          />
+        )
+      case "disabled-header":
+        return (
+          <SidebarDisabledSectionList ref={onElement}>
+            <SidebarDisabledSectionTitle
+              id={`sidebar-disabled-heading-${encodeURIComponent(
+                entry.sectionId
+              )}`}
+            >
+              Disabled
+            </SidebarDisabledSectionTitle>
+          </SidebarDisabledSectionList>
+        )
+      case "group-header":
+        return entry.collapsible ? (
+          <SidebarGroupHeaderRoot ref={onElement}>
+            <SidebarGroupButton
+              type="button"
+              id={`sidebar-group-toggle-${encodeURIComponent(entry.groupId)}`}
+              aria-expanded={entry.expanded}
+              aria-controls={`sidebar-group-region-${encodeURIComponent(
+                entry.groupId
+              )}`}
+              onClick={() => toggleGroupExpanded(entry.label)}
+            >
+              <ResourceGroupSummaryIcon role="presentation" />
+              <SidebarGroupName title={entry.label}>
+                {entry.label === UNLABELED_LABEL ? (
+                  <em>{entry.label}</em>
+                ) : (
+                  entry.label
+                )}
+              </SidebarGroupName>
+              <SidebarGroupStatusSummary
+                labelText={`Status summary for ${entry.label} group`}
+                resources={[...entry.members]}
+              />
+            </SidebarGroupButton>
+          </SidebarGroupHeaderRoot>
+        ) : entry.groupId === "tiltfile" ? (
+          <SidebarTiltfileHeaderRoot
+            ref={onElement}
+            aria-label={`${entry.label} resources`}
+          >
+            <SidebarListSectionName>{entry.label}</SidebarListSectionName>
+          </SidebarTiltfileHeaderRoot>
+        ) : (
+          <SidebarDisabledSectionList ref={onElement}>
+            <SidebarDisabledSectionTitle>
+              {entry.label}
+            </SidebarDisabledSectionTitle>
+          </SidebarDisabledSectionList>
+        )
+    }
   }
-
-  if (options.alertsOnTop) {
-    itemsToDisplay.sort(sortByHasAlerts)
+  const renderEntries = (
+    entries: ReadonlyArray<ResourceVirtualEntry<SidebarItem>>,
+    render: (
+      entry: ResourceVirtualEntry<SidebarItem>,
+      onElement: (element: HTMLElement | null) => void
+    ) => React.ReactNode
+  ) => {
+    const renderCurrentEntry = (entry: ResourceVirtualEntry<SidebarItem>) => (
+      <React.Fragment
+        key={
+          entry.kind === "resource"
+            ? entry.occurrenceKey
+            : entry.kind === "group-header"
+            ? entry.groupId
+            : entry.sectionId
+        }
+      >
+        {render(entry, () => undefined)}
+      </React.Fragment>
+    )
+    if (!props.grouped) {
+      // Filtering deliberately presents one ordinary result list. The model's
+      // ungrouped identity is logical-only here: exposing it as a labeled
+      // region would falsely announce an "unlabeled" group for a real label.
+      const resources = entries.filter(
+        (entry): entry is ResourceVirtualResourceEntry<SidebarItem> =>
+          entry.kind === "resource"
+      )
+      const enabled = resources.filter((entry) => entry.section !== "disabled")
+      const disabled = resources.filter((entry) => entry.section === "disabled")
+      const disabledHeader = entries.find(
+        (entry) => entry.kind === "disabled-header"
+      )
+      return [
+        ...enabled.map(renderCurrentEntry),
+        disabledHeader ? renderCurrentEntry(disabledHeader) : null,
+        disabled.length ? (
+          <li key="disabled-list:ungrouped" role="none">
+            <ul
+              aria-label="Disabled resources"
+              style={{ listStyle: "none", margin: 0, padding: 0 }}
+            >
+              {disabled.map(renderCurrentEntry)}
+            </ul>
+          </li>
+        ) : null,
+      ]
+    }
+    type GroupChunk = {
+      groupId: string
+      entries: ResourceVirtualEntry<SidebarItem>[]
+    }
+    const output: React.ReactNode[] = []
+    const headerGroupIds = new Set<string>()
+    const renderedGroupIds = new Set<string>()
+    let chunk: GroupChunk | undefined
+    const flushChunk = () => {
+      if (!chunk) return
+      const current = chunk
+      chunk = undefined
+      const group = model.groups.get(current.groupId)
+      renderedGroupIds.add(current.groupId)
+      const groupLabel = group?.label ?? current.groupId
+      const resources = current.entries.filter(
+        (entry): entry is ResourceVirtualResourceEntry<SidebarItem> =>
+          entry.kind === "resource"
+      )
+      const enabled = resources.filter((entry) => entry.section !== "disabled")
+      const disabled = resources.filter((entry) => entry.section === "disabled")
+      const disabledHeader = current.entries.find(
+        (entry) => entry.kind === "disabled-header"
+      )
+      output.push(
+        <li
+          key={`region:${current.groupId}`}
+          id={`sidebar-group-region-${encodeURIComponent(current.groupId)}`}
+          role="region"
+          aria-label={`${groupLabel} resources`}
+          style={{ listStyle: "none" }}
+        >
+          <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
+            {enabled.map(renderCurrentEntry)}
+            {disabledHeader ? renderCurrentEntry(disabledHeader) : null}
+            {disabled.length ? (
+              <li key={`disabled-list:${current.groupId}`} role="none">
+                <ul
+                  aria-label="Disabled resources"
+                  style={{ listStyle: "none", margin: 0, padding: 0 }}
+                >
+                  {disabled.map(renderCurrentEntry)}
+                </ul>
+              </li>
+            ) : null}
+          </ul>
+        </li>
+      )
+    }
+    entries.forEach((entry) => {
+      if (entry.kind === "group-header") {
+        flushChunk()
+        headerGroupIds.add(entry.groupId)
+        output.push(
+          <React.Fragment key={`header:${entry.groupId}`}>
+            {render(entry, () => undefined)}
+          </React.Fragment>
+        )
+        return
+      }
+      if (!chunk || chunk.groupId !== entry.groupId) {
+        flushChunk()
+        chunk = { groupId: entry.groupId, entries: [] }
+      }
+      chunk.entries.push(entry)
+    })
+    flushChunk()
+    headerGroupIds.forEach((groupId) => {
+      if (renderedGroupIds.has(groupId)) return
+      const group = model.groups.get(groupId)
+      output.push(
+        <li
+          key={`empty-region:${groupId}`}
+          id={`sidebar-group-region-${encodeURIComponent(groupId)}`}
+          role="region"
+          aria-label={`${group?.label ?? groupId} resources`}
+          style={{ height: 0, listStyle: "none", overflow: "hidden" }}
+        />
+      )
+    })
+    return output
   }
-
-  return itemsToDisplay
+  if (!props.items.length && props.sectionName !== "resources")
+    return (
+      <>
+        <SidebarListSectionItemsRoot ref={props.contentOriginRef}>
+          <NoMatchesFound>No matching resources</NoMatchesFound>
+        </SidebarListSectionItemsRoot>
+        <SidebarKeyboardShortcuts
+          selected={props.selected}
+          items={model.logicalResources}
+          onRequestOccurrence={(
+            entry: ResourceVirtualResourceEntry<SidebarItem>
+          ) => requestOccurrence(entry, "keyboard")}
+          onRequestAll={requestAll}
+          onStartBuild={() => props.selected && startBuild(props.selected)}
+          resourceView={props.resourceView}
+          cursorRequest={cursorRequest}
+        />
+      </>
+    )
+  return (
+    <>
+      {!props.grouped && (
+        <SidebarListSectionName>{props.sectionName}</SidebarListSectionName>
+      )}
+      <SidebarListSectionItemsRoot ref={props.contentOriginRef}>
+        <ResourceVirtualWindow
+          entries={model.entries}
+          scrollOwnerRef={props.ownerRef}
+          contentOriginRef={props.contentOriginRef}
+          contentOriginVersion={contentOriginVersion}
+          targetKey={renderTarget?.occurrenceKey}
+          onTargetMounted={onTargetMounted}
+          renderEntry={renderEntry}
+          renderEntries={renderEntries}
+          asFragment
+          renderSpacer={(height) => (
+            <li aria-hidden="true" style={{ height }} />
+          )}
+        />
+      </SidebarListSectionItemsRoot>
+      <SidebarKeyboardShortcuts
+        selected={props.selected}
+        items={model.logicalResources}
+        onRequestOccurrence={(
+          entry: ResourceVirtualResourceEntry<SidebarItem>
+        ) => requestOccurrence(entry, "keyboard")}
+        onRequestAll={requestAll}
+        onStartBuild={() => props.selected && startBuild(props.selected)}
+        resourceView={props.resourceView}
+        cursorRequest={cursorRequest}
+      />
+    </>
+  )
 }
 
 export class SidebarResources extends React.Component<SidebarProps> {
-  constructor(props: SidebarProps) {
-    super(props)
-    this.startBuildOnSelected = this.startBuildOnSelected.bind(this)
-  }
-
   static contextType = FeaturesContext
-
-  startBuildOnSelected() {
-    if (this.props.selected) {
-      startBuild(this.props.selected)
-    }
+  private readonly ownerRef = React.createRef<HTMLElement>()
+  private readonly contentOriginRef = React.createRef<HTMLUListElement>()
+  state = { ownerReady: false }
+  private setOwner = (element: HTMLElement | null) => {
+    ;(this.ownerRef as React.MutableRefObject<HTMLElement | null>).current =
+      element
+    if (element && !this.state.ownerReady) this.setState({ ownerReady: true })
   }
-
   render() {
     const filteredItems = applyOptionsToItems(
       this.props.items,
       this.props.resourceListOptions
     )
-
-    // only say no matches if there were actually items that got filtered out
-    // otherwise, there might just be 0 resources because there are 0 resources
-    // (though technically there's probably always at least a Tiltfile resource)
-    const resourceFilterApplied =
+    const filterApplied =
       this.props.resourceListOptions.resourceNameFilter.length > 0
-    const sidebarName = resourceFilterApplied
+    const sectionName = filterApplied
       ? `${filteredItems.length} result${filteredItems.length === 1 ? "" : "s"}`
       : "resources"
-
-    let isOverviewClass =
-      this.props.resourceView === ResourceView.OverviewDetail
-        ? "isOverview"
-        : ""
-
-    const labelsEnabled: boolean = this.context.isEnabled(Flag.Labels)
+    const labelsEnabled = this.context.isEnabled(Flag.Labels)
     const resourcesHaveLabels = this.props.items.some(
       (item) => item.labels.length > 0
     )
-
-    // The label group tip is only displayed if labels are enabled but not used
-    const displayLabelGroupsTip = labelsEnabled && !resourcesHaveLabels
-    // The label group view does not display if a resource name filter is applied
-    const displayLabelGroups =
-      !resourceFilterApplied && labelsEnabled && resourcesHaveLabels
-
+    const grouped = !filterApplied && labelsEnabled && resourcesHaveLabels
+    const tip = labelsEnabled && !resourcesHaveLabels
+    const isOverviewClass =
+      this.props.resourceView === ResourceView.OverviewDetail
+        ? "isOverview"
+        : ""
     return (
       <SidebarResourcesRoot
+        ref={this.setOwner}
         aria-label="Resource logs"
         className={`Sidebar-resources ${isOverviewClass}`}
       >
-        {displayLabelGroupsTip && (
-          <ResourceGroupsInfoTip idForIcon={GROUP_INFO_TOOLTIP_ID} />
-        )}
+        {tip && <ResourceGroupsInfoTip idForIcon={GROUP_INFO_TOOLTIP_ID} />}
         <SidebarResourcesContent
-          aria-describedby={
-            displayLabelGroupsTip ? GROUP_INFO_TOOLTIP_ID : undefined
-          }
+          aria-describedby={tip ? GROUP_INFO_TOOLTIP_ID : undefined}
         >
           <OverviewSidebarOptions items={filteredItems} />
           <AllResourcesLink
@@ -540,32 +740,20 @@ export class SidebarResources extends React.Component<SidebarProps> {
             pathBuilder={this.props.pathBuilder}
             selected={this.props.selected}
           />
-          {displayLabelGroups ? (
-            <SidebarGroupedByLabels
+          {this.state.ownerReady && (
+            <SidebarVirtualList
               {...this.props}
               items={filteredItems}
-              onStartBuild={this.startBuildOnSelected}
-            />
-          ) : (
-            <SidebarListSection
-              {...this.props}
-              sectionName={sidebarName}
-              items={filteredItems}
+              grouped={grouped}
+              tip={tip}
+              sectionName={sectionName}
+              ownerRef={this.ownerRef}
+              contentOriginRef={this.contentOriginRef}
             />
           )}
         </SidebarResourcesContent>
-        {/* The label groups display handles the keyboard shortcuts separately. */}
-        {displayLabelGroups ? null : (
-          <SidebarKeyboardShortcuts
-            selected={this.props.selected}
-            items={enabledItemsFirst(filteredItems)}
-            onStartBuild={this.startBuildOnSelected}
-            resourceView={this.props.resourceView}
-          />
-        )}
       </SidebarResourcesRoot>
     )
   }
 }
-
 export default SidebarResources

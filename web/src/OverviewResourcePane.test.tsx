@@ -10,10 +10,55 @@ import { MemoryRouter } from "react-router-dom"
 import LogStore, { LogStoreProvider } from "./LogStore"
 import OverviewResourcePane from "./OverviewResourcePane"
 import { ResourceNavProvider } from "./ResourceNav"
+import { ResourceGroupsContextProvider } from "./ResourceGroupsContext"
 import { SidebarContextProvider } from "./SidebarContext"
 import { nResourceView, oneResourceView, TestDataView } from "./testdata"
 import { appendLinesForManifestAndSpan, Line } from "./testlogs"
 import { LogLevel, UIResource } from "./types"
+
+class ResizeObserverStub {
+  observe() {}
+  disconnect() {}
+  unobserve() {}
+}
+
+let originalClientHeight: PropertyDescriptor | undefined
+let originalRect: typeof HTMLElement.prototype.getBoundingClientRect
+
+beforeAll(() => {
+  // jsdom has no layout. Keep virtual-list production checks fail-closed and
+  // provide the same browser-shaped geometry the mounted sidebar receives.
+  originalClientHeight = Object.getOwnPropertyDescriptor(
+    HTMLElement.prototype,
+    "clientHeight"
+  )
+  originalRect = HTMLElement.prototype.getBoundingClientRect
+  Object.defineProperty(window, "ResizeObserver", {
+    configurable: true,
+    value: ResizeObserverStub,
+  })
+  Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+    configurable: true,
+    get() {
+      return this.getAttribute("aria-label") === "Resource logs" ? 240 : 24
+    },
+  })
+  HTMLElement.prototype.getBoundingClientRect = function () {
+    const isOwner = this.getAttribute("aria-label") === "Resource logs"
+    const top = isOwner ? 0 : 48
+    return { top, bottom: top + 24, height: 24 } as DOMRect
+  }
+})
+
+afterAll(() => {
+  if (originalClientHeight)
+    Object.defineProperty(
+      HTMLElement.prototype,
+      "clientHeight",
+      originalClientHeight
+    )
+  HTMLElement.prototype.getBoundingClientRect = originalRect
+})
 
 function customRender(
   options: {
@@ -43,7 +88,9 @@ function customRender(
               <SidebarContextProvider
                 sidebarClosedForTesting={options.sidebarClosed}
               >
-                {children}
+                <ResourceGroupsContextProvider>
+                  {children}
+                </ResourceGroupsContextProvider>
               </SidebarContextProvider>
             </ResourceNavProvider>
           </SnackbarProvider>

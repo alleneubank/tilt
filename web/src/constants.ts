@@ -52,6 +52,3 @@ export function linkToTiltAsset(
 ) {
   return `${TILT_PUBLIC_ASSETS_LINK}/${assetType}/${filename}`
 }
-
-export const DEFAULT_RESOURCE_LIST_LIMIT = 20
-export const RESOURCE_LIST_MULTIPLIER = 2

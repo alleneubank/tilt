@@ -71,6 +71,50 @@ function assertSidebarItemsAndOptions(
 
 beforeEach(() => {})
 
+let originalClientHeight: PropertyDescriptor | undefined
+let originalRect: typeof HTMLElement.prototype.getBoundingClientRect
+
+class ResizeObserverStub {
+  observe() {}
+  disconnect() {}
+  unobserve() {}
+}
+
+beforeAll(() => {
+  // jsdom deliberately has no layout. This is a narrow, browser-shaped layout
+  // fixture so the integration test exercises production's fail-closed path.
+  originalClientHeight = Object.getOwnPropertyDescriptor(
+    HTMLElement.prototype,
+    "clientHeight"
+  )
+  originalRect = HTMLElement.prototype.getBoundingClientRect
+  Object.defineProperty(window, "ResizeObserver", {
+    configurable: true,
+    value: ResizeObserverStub,
+  })
+  Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+    configurable: true,
+    get() {
+      return this.getAttribute("aria-label") === "Resource logs" ? 240 : 24
+    },
+  })
+  HTMLElement.prototype.getBoundingClientRect = function () {
+    const isOwner = this.getAttribute("aria-label") === "Resource logs"
+    const top = isOwner ? 0 : 48
+    return { top, bottom: top + 24, height: 24 } as DOMRect
+  }
+})
+
+afterAll(() => {
+  if (originalClientHeight)
+    Object.defineProperty(
+      HTMLElement.prototype,
+      "clientHeight",
+      originalClientHeight
+    )
+  HTMLElement.prototype.getBoundingClientRect = originalRect
+})
+
 afterEach(() => {
   localStorage.clear()
   resourceListOptionsAccessor.set({
@@ -117,7 +161,13 @@ describe("overview sidebar options", () => {
 })
 
 it("toggles/untoggles Alerts On Top sorting when button clicked", () => {
-  const { container } = render(TestsWithErrors())
+  // The story helper is normally decorated with this provider. Keep the
+  // direct integration render equivalent to the real sidebar tree.
+  const { container } = render(
+    <ResourceGroupsContextProvider>
+      {TestsWithErrors()}
+    </ResourceGroupsContextProvider>
+  )
 
   const origOrder = [
     "(Tiltfile)",

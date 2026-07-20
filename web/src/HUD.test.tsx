@@ -11,6 +11,7 @@ import {
   logList,
   nButtonView,
   nResourceView,
+  oneResource,
   oneResourceView,
   twoResourceView,
 } from "./testdata"
@@ -52,6 +53,73 @@ class RouterHUD extends Component {
     )
   }
 }
+
+class HUDResizeObserver {
+  constructor(_callback: ResizeObserverCallback) {}
+  observe() {}
+  disconnect() {}
+  unobserve() {}
+}
+
+let originalClientHeight: PropertyDescriptor | undefined
+let originalRect: PropertyDescriptor | undefined
+let originalResizeObserver: PropertyDescriptor | undefined
+
+beforeAll(() => {
+  // jsdom has no layout. The HUD mounts an overview virtual window, so model
+  // its scroll owner and rows without changing production's fail-closed checks.
+  originalClientHeight = Object.getOwnPropertyDescriptor(
+    HTMLElement.prototype,
+    "clientHeight"
+  )
+  originalRect = Object.getOwnPropertyDescriptor(
+    HTMLElement.prototype,
+    "getBoundingClientRect"
+  )
+  originalResizeObserver = Object.getOwnPropertyDescriptor(
+    window,
+    "ResizeObserver"
+  )
+  Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+    configurable: true,
+    get() {
+      return this.getAttribute("aria-label") === "Resources overview" ? 240 : 24
+    },
+  })
+  Object.defineProperty(HTMLElement.prototype, "getBoundingClientRect", {
+    configurable: true,
+    value: function () {
+      const isOwner = this.getAttribute("aria-label") === "Resources overview"
+      const top = isOwner ? 0 : 48
+      const height = isOwner ? 240 : 24
+      return { top, bottom: top + height, height } as DOMRect
+    },
+  })
+  Object.defineProperty(window, "ResizeObserver", {
+    configurable: true,
+    value: HUDResizeObserver,
+  })
+})
+
+afterAll(() => {
+  if (originalClientHeight)
+    Object.defineProperty(
+      HTMLElement.prototype,
+      "clientHeight",
+      originalClientHeight
+    )
+  else Reflect.deleteProperty(HTMLElement.prototype, "clientHeight")
+  if (originalRect)
+    Object.defineProperty(
+      HTMLElement.prototype,
+      "getBoundingClientRect",
+      originalRect
+    )
+  else Reflect.deleteProperty(HTMLElement.prototype, "getBoundingClientRect")
+  if (originalResizeObserver)
+    Object.defineProperty(window, "ResizeObserver", originalResizeObserver)
+  else Reflect.deleteProperty(window, "ResizeObserver")
+})
 
 beforeEach(() => {
   Date.now = jest.fn(() => 1482363367071)
@@ -331,5 +399,54 @@ describe("mergeAppUpdates", () => {
     }
     let result = mergeAppUpdate<"view" | "logStore">(prevState as any, update)
     expect(result).toBe(null)
+  })
+
+  it("keeps every view identity through repeated log-only updates", () => {
+    const view = nButtonView(3)
+    const prevState = { view, logStore: new LogStore() }
+    const resources = view.uiResources
+    const buttons = view.uiButtons
+    const resourceObjects = [...resources]
+
+    ;["first", "second", "third"].forEach((line) => {
+      const result = mergeAppUpdate<"view" | "logStore">(prevState as any, {
+        view: { logList: logList([line]) },
+      })
+      expect(result).toBe(null)
+      expect(prevState.view).toBe(view)
+      expect(prevState.view.uiResources).toBe(resources)
+      expect(prevState.view.uiButtons).toBe(buttons)
+      prevState.view.uiResources!.forEach((resource, index) =>
+        expect(resource).toBe(resourceObjects[index])
+      )
+    })
+  })
+
+  it("replaces only the updated resource while retaining unrelated identities", () => {
+    const view = nResourceView(4)
+    const prevState = { view, logStore: new LogStore() }
+    const originalResources = view.uiResources!
+    const originalButtons = view.uiButtons!
+    const replacement = oneResource({ name: "_2" })
+
+    const result = mergeAppUpdate<"view" | "logStore">(prevState as any, {
+      view: { uiResources: [replacement] },
+    })
+    const nextResources = result!.view.uiResources!
+
+    expect(result!.view).not.toBe(view)
+    expect(result!.view.uiButtons).toBe(originalButtons)
+    expect(
+      nextResources.find((resource) => resource.metadata?.name === "_2")
+    ).toBe(replacement)
+    originalResources
+      .filter((resource) => resource.metadata?.name !== "_2")
+      .forEach((resource) =>
+        expect(
+          nextResources.find(
+            (next) => next.metadata?.name === resource.metadata?.name
+          )
+        ).toBe(resource)
+      )
   })
 })

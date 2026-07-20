@@ -1,4 +1,4 @@
-import React, { MutableRefObject, useEffect, useRef } from "react"
+import React from "react"
 import TimeAgo from "react-timeago"
 import styled from "styled-components"
 import { Hold } from "./Hold"
@@ -30,12 +30,14 @@ import { ResourceStatus, ResourceView } from "./types"
 import Tooltip from "./Tooltip"
 
 export const SidebarItemRoot = styled.li`
-  & + & {
-    margin-top: ${SizeUnit(0.35)};
+  /* Virtual rows cannot inherit geometry from mounted DOM siblings. The
+     continuation owns its historic separation so its border box is complete. */
+  box-sizing: border-box;
+  &.resourceVirtualContinuation {
+    padding-top: ${SizeUnit(0.35)};
   }
-
-  &.isDisabled + &.isDisabled {
-    margin-top: ${SizeUnit(1 / 16)};
+  &.resourceVirtualContinuation.isDisabled {
+    padding-top: ${SizeUnit(1 / 16)};
   }
 
   /* smaller margin-left since the star icon takes up space */
@@ -51,6 +53,12 @@ export const SidebarItemRoot = styled.li`
      items so they align with grouped items */
   &.groupViewIndent {
     margin-left: ${SizeUnit(2 / 3)};
+  }
+
+  /* Flattened label groups retain the old accordion-details right edge
+     without inheriting its indentation. */
+  &.groupViewFlat {
+    margin-right: unset;
   }
 `
 // Shared styles between the enabled and disabled item boxes
@@ -105,9 +113,11 @@ export let SidebarItemBox = styled.div`
 
 const DisabledSidebarItemBox = styled.div`
   ${sidebarItemBoxMixin};
+  ${mixinTruncateText};
   color: ${Color.gray50};
   font-family: ${Font.sansSerif};
   font-style: italic;
+  min-width: 0;
   padding: ${SizeUnit(1 / 8)} ${SizeUnit(1 / 4)};
 
   &:hover {
@@ -208,6 +218,13 @@ export type SidebarItemViewProps = {
   resourceView: ResourceView
   pathBuilder: PathBuilder
   groupView?: boolean
+  flattenedGroupView?: boolean
+  /** Typed model identity makes continuation flow independent of DOM siblings. */
+  flow?: "leading" | "continuation"
+  rootRef?: (element: HTMLLIElement | null) => void
+  /** Identifies the rendered label occurrence before route navigation. */
+  occurrenceKey?: string
+  onRequestOccurrence?: () => void
 }
 
 function buildStatusText(item: SidebarItem): string {
@@ -299,15 +316,31 @@ export function DisabledSidebarItemView(props: SidebarItemViewProps) {
   const { item, selected, groupView } = props
   const isSelectedClass = selected ? "isSelected" : ""
   const groupViewIndentClass = groupView ? "groupViewIndent" : ""
+  const groupViewFlatClass = props.flattenedGroupView ? "groupViewFlat" : ""
+  const flowClass =
+    props.flow === "continuation" ? "resourceVirtualContinuation" : ""
 
   return (
     <SidebarItemRoot
-      className={`u-showStarOnHover ${isSelectedClass} ${groupViewIndentClass} isDisabled`}
+      ref={props.rootRef}
+      id={
+        props.occurrenceKey
+          ? `sidebar-resource-${encodeURIComponent(props.occurrenceKey)}`
+          : undefined
+      }
+      className={`u-showStarOnHover ${isSelectedClass} ${groupViewIndentClass} ${groupViewFlatClass} ${flowClass} isDisabled`}
     >
       <StarResourceButton resourceName={item.name} />
       <DisabledSidebarItemBox
         className={`${isSelectedClass}`}
-        onClick={(_e) => openResource(item.name)}
+        data-name={item.name}
+        data-occurrence-key={props.occurrenceKey}
+        title={item.name}
+        tabIndex={-1}
+        onClick={(_e) => {
+          props.onRequestOccurrence?.()
+          openResource(item.name)
+        }}
         role="link"
       >
         {item.name}
@@ -331,27 +364,33 @@ export function EnabledSidebarItemView(props: SidebarItemViewProps) {
   let isBuildingClass = building ? "isBuilding" : ""
   let onStartBuild = startBuild.bind(null, item.name)
   const groupViewIndentClass = props.groupView ? "groupViewIndent" : ""
-  let ref: MutableRefObject<HTMLLIElement | null> = useRef(null)
-
-  useEffect(() => {
-    if (isSelected && ref.current?.scrollIntoView) {
-      ref.current.scrollIntoView({ block: "nearest" })
-    }
-  }, [item.name, isSelected, ref])
-
+  const groupViewFlatClass = props.flattenedGroupView ? "groupViewFlat" : ""
+  const flowClass =
+    props.flow === "continuation" ? "resourceVirtualContinuation" : ""
   return (
     <SidebarItemRoot
-      ref={ref}
+      ref={props.rootRef}
       key={item.name}
-      className={`u-showStarOnHover u-showTriggerModeOnHover ${isSelectedClass} ${isBuildingClass} ${groupViewIndentClass}`}
+      id={
+        props.occurrenceKey
+          ? `sidebar-resource-${encodeURIComponent(props.occurrenceKey)}`
+          : undefined
+      }
+      className={`u-showStarOnHover u-showTriggerModeOnHover ${isSelectedClass} ${isBuildingClass} ${groupViewIndentClass} ${groupViewFlatClass} ${flowClass}`}
     >
       <StarResourceButton resourceName={item.name} />
       <SidebarItemBox
         className={`${isSelectedClass} ${isBuildingClass}`}
         tabIndex={-1}
         role="button"
-        onClick={(e) => nav.openResource(item.name)}
+        onClick={(e) => {
+          // Build controls are interactive descendants, not row navigation.
+          if ((e.target as HTMLElement).closest("button")) return
+          props.onRequestOccurrence?.()
+          nav.openResource(item.name)
+        }}
         data-name={item.name}
+        data-occurrence-key={props.occurrenceKey}
       >
         <SidebarItemInnerBox>
           <SidebarItemRuntimeBox>

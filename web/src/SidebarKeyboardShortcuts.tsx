@@ -2,15 +2,41 @@ import React, { Component } from "react"
 import { ResourceNav, useResourceNav } from "./ResourceNav"
 import { isTargetEditable } from "./shortcut"
 import SidebarItem from "./SidebarItem"
+import { ResourceVirtualResourceEntry } from "./ResourceVirtualModel"
 import { ResourceName, ResourceView } from "./types"
 
 type Props = {
-  items: SidebarItem[]
+  items: ReadonlyArray<ResourceVirtualResourceEntry<SidebarItem>>
   selected: string
   resourceNav: ResourceNav
   resourceView: ResourceView
   onStartBuild: () => void
+  onRequestOccurrence: (
+    entry: ResourceVirtualResourceEntry<SidebarItem>,
+    origin: OccurrenceCursorRequest["origin"]
+  ) => void
+  onRequestAll: () => void
+  cursorRequest?: OccurrenceCursorRequest
 }
+
+/** A parent-owned navigation request for one exact logical occurrence. */
+export type OccurrenceCursorRequest = Readonly<
+  (
+    | {
+        kind: "aggregate"
+        resourceName: ResourceName.all
+      }
+    | {
+        kind: "occurrence"
+        occurrenceKey: string
+        resourceName: string
+      }
+  ) & {
+    requestId: number
+    origin: "keyboard" | "pointer"
+    phase: "positioning" | "awaiting-route" | "settled"
+  }
+>
 
 /**
  * Sets up keyboard shortcuts that depend on the state of the sidebar.
@@ -43,19 +69,41 @@ class SidebarKeyboardShortcuts extends Component<Props> {
     switch (e.key) {
       case "j":
       case "k":
-        // An array of sidebar items, plus one at the beginning for 'All'
-        let names = [ResourceName.all as string].concat(
-          items.map((item) => item.name)
+        // The cursor holds an occurrence identity, not a name. A resource can
+        // occur beside itself under multiple labels, and name.indexOf loses it.
+        const cursor = this.props.cursorRequest
+        const selectedIndex = items.findIndex(
+          (item) => item.resourceName === selected
         )
-        let index = names.indexOf(selected)
+        // All is a real position before resource occurrences. Starred is an
+        // external selection before that position, matching the original
+        // names.indexOf behavior without pretending it is a virtual row.
+        const index =
+          cursor?.kind === "aggregate"
+            ? 0
+            : cursor?.kind === "occurrence"
+            ? items.findIndex(
+                (item) => item.occurrenceKey === cursor.occurrenceKey
+              ) + 1
+            : selected === ResourceName.all
+            ? 0
+            : selectedIndex < 0
+            ? -1
+            : selectedIndex + 1
         let dir = e.key === "j" ? 1 : -1
         let targetIndex = index + dir
-        if (targetIndex < 0 || targetIndex >= names.length) {
+        if (targetIndex < 0 || targetIndex > items.length) {
           return
         }
-
-        let name = names[targetIndex]
-        this.props.resourceNav.openResource(name)
+        if (targetIndex === 0) {
+          this.props.onRequestAll()
+          this.props.resourceNav.openResource(ResourceName.all)
+          e.preventDefault()
+          return
+        }
+        const target = items[targetIndex - 1]
+        this.props.onRequestOccurrence(target, "keyboard")
+        this.props.resourceNav.openResource(target.resourceName)
         e.preventDefault()
         break
 
@@ -63,7 +111,6 @@ class SidebarKeyboardShortcuts extends Component<Props> {
         if (e.metaKey || e.ctrlKey) {
           return
         }
-        let item = items.find((item) => item.name == selected)
         this.props.onStartBuild()
         e.preventDefault()
         break
@@ -76,10 +123,16 @@ class SidebarKeyboardShortcuts extends Component<Props> {
 }
 
 type PublicProps = {
-  items: SidebarItem[]
+  items: ReadonlyArray<ResourceVirtualResourceEntry<SidebarItem>>
   selected: string
   onStartBuild: () => void
   resourceView: ResourceView
+  onRequestOccurrence: (
+    entry: ResourceVirtualResourceEntry<SidebarItem>,
+    origin: OccurrenceCursorRequest["origin"]
+  ) => void
+  onRequestAll: () => void
+  cursorRequest?: OccurrenceCursorRequest
 }
 
 export default function (props: PublicProps) {
