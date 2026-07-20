@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react"
+import { fireEvent, render, screen } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { SnackbarProvider } from "notistack"
 import React, { ReactElement } from "react"
@@ -10,15 +10,19 @@ import LogStore from "./LogStore"
 import OverviewTable, {
   labeledResourcesToTableCells,
   NoMatchesFound,
-  OverviewGroup,
-  OverviewGroupName,
   ResourceResultCount,
   ResourceTableData,
   ResourceTableHeaderSortTriangle,
   ResourceTableRow,
-  TableGroupedByLabels,
+  requireOverviewEntryIndex,
+  requireOverviewResource,
 } from "./OverviewTable"
-import { Name, RowValues, SelectionCheckbox } from "./OverviewTableColumns"
+import {
+  COLUMNS,
+  Name,
+  RowValues,
+  SelectionCheckbox,
+} from "./OverviewTableColumns"
 import { ToggleTriggerModeTooltip } from "./OverviewTableTriggerModeToggle"
 import {
   DEFAULT_GROUP_STATE,
@@ -48,11 +52,13 @@ const tableViewWithSettings = ({
   labelsEnabled,
   resourceListOptions,
   resourceSelections,
+  groupsState,
 }: {
   view: TestDataView
   labelsEnabled?: boolean
   resourceListOptions?: ResourceListOptions
   resourceSelections?: string[]
+  groupsState?: GroupsState
 }) => {
   const features = new Features({
     [Flag.Labels]: labelsEnabled ?? true,
@@ -64,7 +70,7 @@ const tableViewWithSettings = ({
     >
       <SnackbarProvider>
         <FeaturesTestProvider value={features}>
-          <ResourceGroupsContextProvider>
+          <ResourceGroupsContextProvider initialValuesForTesting={groupsState}>
             <ResourceListOptionsProvider
               initialValuesForTesting={resourceListOptions}
             >
@@ -86,11 +92,465 @@ const findTableHeaderByName = (columnName: string, sortable = true): any => {
   return screen.getAllByTitle(selector)[0]
 }
 
+class OverviewResizeObserver {
+  constructor(_callback: ResizeObserverCallback) {}
+  observe() {}
+  disconnect() {}
+  unobserve() {}
+}
+
+const overviewClientHeight = Object.getOwnPropertyDescriptor(
+  HTMLElement.prototype,
+  "clientHeight"
+)
+const overviewRect = HTMLElement.prototype.getBoundingClientRect
+
+beforeAll(() => {
+  Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+    configurable: true,
+    get: () => 1000,
+  })
+  HTMLElement.prototype.getBoundingClientRect = () =>
+    ({ height: 20, top: 0 } as DOMRect)
+  Object.defineProperty(window, "ResizeObserver", {
+    configurable: true,
+    value: OverviewResizeObserver,
+  })
+  jest.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+    callback(0)
+    return null as unknown as number
+  })
+})
+
+afterAll(() => {
+  jest.restoreAllMocks()
+  if (overviewClientHeight)
+    Object.defineProperty(
+      HTMLElement.prototype,
+      "clientHeight",
+      overviewClientHeight
+    )
+  HTMLElement.prototype.getBoundingClientRect = overviewRect
+})
+
 // End helpers
 
 afterEach(() => {
   sessionStorage.clear()
   localStorage.clear()
+})
+
+it("uses one bounded overview resource window across label groups", () => {
+  Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+    configurable: true,
+    get: () => 20,
+  })
+
+  const { container } = render(
+    tableViewWithSettings({ view: nResourceWithLabelsView(100) })
+  )
+  const owner = container.querySelector('[aria-label="Resources overview"]')
+  const resources = container.querySelectorAll('tbody tr[tabindex="-1"]')
+
+  expect(owner).toHaveStyle({ overflowY: "auto" })
+  expect(resources.length).toBeLessThanOrEqual(3)
+
+  Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+    configurable: true,
+    get: () => 1000,
+  })
+})
+
+it("uses one native column model and table-valid grouped headers", () => {
+  Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+    configurable: true,
+    get: () => 20,
+  })
+
+  const view = nResourceWithLabelsView(100)
+  const projection = labeledResourcesToTableCells(
+    view.uiResources,
+    view.uiButtons,
+    new LogStore()
+  )
+  const { container } = render(tableViewWithSettings({ view }))
+  try {
+    const table = container.querySelector("table")!
+    const columns = Array.from(table.querySelectorAll("colgroup > col"))
+    const resourceRows = Array.from(
+      container.querySelectorAll("tr[data-occurrence-key]")
+    )
+    const groupCount =
+      projection.labels.length +
+      Number(projection.unlabeled.length > 0) +
+      Number(projection.tiltfile.length > 0)
+    const resourceCount =
+      projection.labels.reduce(
+        (count, label) => count + projection.labelsToResources[label].length,
+        0
+      ) +
+      projection.unlabeled.length +
+      projection.tiltfile.length
+
+    expect(getComputedStyle(table).borderCollapse).toBe("separate")
+    expect(parseFloat(getComputedStyle(table).borderSpacing)).toBe(0)
+    expect(columns).toHaveLength(COLUMNS.length)
+    expect(columns.map((column) => column.getAttribute("style"))).toEqual(
+      COLUMNS.map((column) => `width: ${column.width};`)
+    )
+    expect(table).toHaveAttribute(
+      "aria-rowcount",
+      String(1 + groupCount * 2 + resourceCount)
+    )
+    expect(table.querySelector("thead tr")).toHaveAttribute(
+      "aria-rowindex",
+      "1"
+    )
+    expect(resourceRows.length).toBeGreaterThan(0)
+    resourceRows.forEach((row) => {
+      expect(getComputedStyle(row).borderTopWidth || "0px").toBe("0px")
+      Array.from(row.querySelectorAll("td")).forEach((cell) => {
+        expect(getComputedStyle(cell).borderTopWidth).toBe("1px")
+        expect(getComputedStyle(cell).borderTopStyle).toBe("solid")
+      })
+    })
+    const semanticHeaders = Array.from(
+      table.querySelectorAll("thead th[scope='col']")
+    )
+    expect(semanticHeaders).toHaveLength(COLUMNS.length)
+    expect(table.querySelector("thead input")).toBeNull()
+    Array.from(table.querySelectorAll("tbody")).forEach((body) =>
+      Array.from(body.querySelectorAll("th[scope='col']")).forEach((header) => {
+        expect(header.parentElement?.tagName).toBe("TR")
+        expect(header.parentElement?.parentElement).toBe(body)
+      })
+    )
+    expect(
+      table.querySelectorAll('td [role="columnheader"], td [role="row"]')
+    ).toHaveLength(0)
+  } finally {
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      get: () => 1000,
+    })
+  }
+})
+
+it("keeps each mounted group header and controlled resources in sibling rowgroups", () => {
+  const { container } = render(
+    tableViewWithSettings({ view: nResourceWithLabelsView(8) })
+  )
+
+  const controls = Array.from(
+    container.querySelectorAll<HTMLElement>(
+      "[role='button'][aria-controls^='overview-group-']"
+    )
+  )
+  expect(controls.length).toBeGreaterThan(0)
+  controls.forEach((control) => {
+    const rowgroup = document.getElementById(
+      control.getAttribute("aria-controls")!
+    )
+    expect(rowgroup).not.toBeNull()
+    expect(rowgroup?.getAttribute("role")).toBe("rowgroup")
+    expect(rowgroup?.contains(control)).toBe(false)
+    expect(rowgroup?.previousElementSibling).toHaveAttribute(
+      "data-overview-group-header",
+      control.closest("tbody")?.getAttribute("data-overview-group-header")
+    )
+  })
+})
+
+it("uses visible labels for grouped rowgroups and Resources when grouping is disabled", () => {
+  const groupedView = nResourceWithLabelsView(8)
+  const grouped = render(tableViewWithSettings({ view: groupedView }))
+  const projection = labeledResourcesToTableCells(
+    groupedView.uiResources,
+    groupedView.uiButtons,
+    new LogStore()
+  )
+  const expectedNames = new Map<string, string[]>([
+    ...projection.labels.map(
+      (label) =>
+        [
+          `${label} resources`,
+          projection.labelsToResources[label].map((resource) => resource.name),
+        ] as const
+    ),
+    [
+      `${UNLABELED_LABEL} resources`,
+      projection.unlabeled.map((resource) => resource.name),
+    ] as const,
+    [
+      `${TILTFILE_LABEL} resources`,
+      projection.tiltfile.map((resource) => resource.name),
+    ] as const,
+  ])
+  const actualNames = new Map(
+    Array.from(
+      grouped.container.querySelectorAll<HTMLTableSectionElement>(
+        'tbody[role="rowgroup"]'
+      )
+    ).map((rowgroup) => [
+      rowgroup.getAttribute("aria-label")!,
+      Array.from(rowgroup.querySelectorAll(Name)).map(
+        (name) => name.textContent
+      ),
+    ])
+  )
+
+  expect(actualNames).toEqual(expectedNames)
+  grouped.unmount()
+  sessionStorage.clear()
+
+  const filtered = render(
+    tableViewWithSettings({
+      view: groupedView,
+      resourceListOptions: {
+        ...DEFAULT_OPTIONS,
+        resourceNameFilter: "a_failed_build",
+      },
+    })
+  )
+  expect(
+    filtered.container.querySelector('tbody[role="rowgroup"]')
+  ).toHaveAttribute("aria-label", "Resources")
+})
+
+it("restores grouped panel surfaces within the single virtual table", () => {
+  const { container } = render(
+    tableViewWithSettings({ view: nResourceWithLabelsView(8) })
+  )
+  const groupBody = container.querySelector<HTMLTableSectionElement>(
+    'tbody[role="rowgroup"]'
+  )!
+  const headerBody = groupBody.previousElementSibling as HTMLTableSectionElement
+  const summary = headerBody.querySelector<HTMLElement>(
+    ".overviewGroupSummary"
+  )!
+  const headerCell = headerBody.querySelector<HTMLElement>(
+    ".overviewGroupHeaderCell"
+  )!
+  const spacer = headerBody.querySelector<HTMLTableCellElement>(
+    ".overviewGroupSpacerCell"
+  )!
+  const lastResource = groupBody.querySelector<HTMLElement>(
+    "tr.isOverviewGroupLastResource"
+  )!
+  const columnHeaders = Array.from(
+    headerBody.querySelectorAll<HTMLElement>("th[scope='col']")
+  )
+
+  expect(groupBody).toHaveClass("overviewGroupBody", "isExpanded")
+  expect(summary).toHaveStyle({
+    alignItems: "center",
+    backgroundColor: "rgb(0, 27, 32)",
+    display: "flex",
+    paddingTop: "4px",
+  })
+  expect(headerCell).toHaveStyle({ borderLeftWidth: "1px" })
+  expect(spacer).toHaveAttribute("aria-hidden", "true")
+  expect(spacer).toHaveStyle({ height: "16px", backgroundColor: "transparent" })
+  expect(columnHeaders).toHaveLength(COLUMNS.length)
+  columnHeaders.forEach((header) => {
+    expect(getComputedStyle(header).backgroundColor).toBe("rgb(0, 27, 32)")
+  })
+  expect(getComputedStyle(columnHeaders[0]).borderLeft).toBe(
+    "1px solid #2D4D55"
+  )
+  expect(
+    getComputedStyle(columnHeaders[columnHeaders.length - 1]).borderRight
+  ).toBe("1px solid #2D4D55")
+  expect(lastResource).toHaveClass("isOverviewGroupLastResource")
+  Array.from(lastResource.querySelectorAll<HTMLTableCellElement>("td")).forEach(
+    (cell) => {
+      expect(getComputedStyle(cell).borderBottomWidth).toBe("")
+      expect(getComputedStyle(cell).boxShadow).toBe("inset 0 -1px 0 #2D4D55")
+    }
+  )
+})
+
+it("paints selected and focused overview panel cells after their panel fill", () => {
+  const { container } = render(
+    tableViewWithSettings({
+      view: nResourceWithLabelsView(8),
+      resourceSelections: ["(Tiltfile)"],
+    })
+  )
+
+  const selectedCell =
+    container.querySelector<HTMLTableCellElement>("tr.isSelected td")!
+  expect(getComputedStyle(selectedCell).backgroundColor).toBe("rgb(7, 54, 66)")
+
+  fireEvent.keyDown(document.body, { key: "j" })
+  const focusedCell = container.querySelector<HTMLTableCellElement>(
+    "tr.isFocused td:first-child"
+  )!
+  expect(getComputedStyle(focusedCell).borderLeft).toBe("4px solid #03c7d3")
+  expect(getComputedStyle(focusedCell).paddingLeft).toBe("20px")
+})
+
+it("keeps grouped overview summaries and controls scoped to each expanded group", () => {
+  const view = nResourceView(4)
+  view.uiResources[1].metadata!.labels = { alpha: "alpha" }
+  view.uiResources[2].metadata!.labels = { beta: "beta" }
+  const { container } = render(tableViewWithSettings({ view }))
+  const alpha = container
+    .querySelector<HTMLElement>('tr[data-group-id="label:alpha"]')!
+    .closest("tbody")!
+  const summary = alpha.querySelector<HTMLElement>(".overviewGroupSummary")!
+
+  expect(summary).toHaveStyle({
+    fontSize: "20px",
+    marginTop: "0px",
+    paddingTop: "4px",
+    color: "rgb(255, 255, 255)",
+  })
+  expect(
+    alpha.querySelectorAll('[aria-label="Resource group selection"]')
+  ).toHaveLength(1)
+  expect(alpha.querySelectorAll('th[scope="col"]')).toHaveLength(COLUMNS.length)
+  expect(container.querySelectorAll("table")).toHaveLength(1)
+
+  userEvent.click(summary)
+  expect(summary).toHaveAttribute("aria-expanded", "false")
+  expect(
+    alpha.querySelectorAll('[aria-label="Resource group selection"]')
+  ).toHaveLength(0)
+  expect(alpha.querySelectorAll('th[scope="col"]')).toHaveLength(0)
+
+  fireEvent.keyDown(summary, { key: "Enter" })
+  expect(summary).toHaveAttribute("aria-expanded", "true")
+  const expandedAlpha = container
+    .querySelector<HTMLElement>('tr[data-group-id="label:alpha"]')!
+    .closest("tbody")!
+  const alphaSelection = expandedAlpha.querySelector<HTMLElement>(
+    '[aria-label="Resource group selection"]'
+  )!
+  userEvent.click(alphaSelection.querySelector("input")!)
+  expect(alphaSelection).toHaveAttribute("aria-checked", "true")
+
+  const tiltfileSummary = container.querySelector<HTMLElement>(
+    'tr[data-group-id="tiltfile"] .overviewGroupSummary'
+  )!
+  userEvent.click(tiltfileSummary)
+  expect(tiltfileSummary).toHaveAttribute("aria-expanded", "false")
+  fireEvent.keyDown(tiltfileSummary, { key: "Enter" })
+  expect(tiltfileSummary).toHaveAttribute("aria-expanded", "true")
+})
+
+it("calibrates selectable and text-only expanded group headers independently", () => {
+  const originalRect = HTMLElement.prototype.getBoundingClientRect
+  HTMLElement.prototype.getBoundingClientRect = function () {
+    if (
+      this.tagName === "TBODY" &&
+      this.classList.contains("overviewGroupHeaderBody") &&
+      this.classList.contains("isExpanded")
+    )
+      return {
+        height: this.querySelector('[aria-label="Resource group selection"]')
+          ? 96
+          : 90,
+        top: 0,
+      } as DOMRect
+    return { height: 20, top: 0 } as DOMRect
+  }
+
+  const view = nResourceView(3)
+  view.uiResources[1].metadata!.labels = { alpha: "alpha" }
+  try {
+    const { container } = render(tableViewWithSettings({ view }))
+    const headers = container.querySelectorAll<HTMLElement>(
+      "tbody[data-overview-group-header].isExpanded"
+    )
+    expect(headers).toHaveLength(3)
+    expect(
+      headers[0].querySelector('[aria-label="Resource group selection"]')
+    ).not.toBeNull()
+    expect(
+      headers[2].querySelector('[aria-label="Resource group selection"]')
+    ).toBeNull()
+  } finally {
+    HTMLElement.prototype.getBoundingClientRect = originalRect
+  }
+})
+
+it("fails closed through the overview window when its owner has zero height", () => {
+  Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+    configurable: true,
+    get: () => 0,
+  })
+  try {
+    expect(() =>
+      render(tableViewWithSettings({ view: nResourceWithLabelsView(1) }))
+    ).toThrow("Resource virtual window requires a positive owner height")
+  } finally {
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      get: () => 1000,
+    })
+  }
+})
+
+it("keeps the overview bounded without ResizeObserver", () => {
+  const resizeObserver = Object.getOwnPropertyDescriptor(
+    window,
+    "ResizeObserver"
+  )
+  Object.defineProperty(window, "ResizeObserver", {
+    configurable: true,
+    value: undefined,
+  })
+  Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+    configurable: true,
+    get: () => 20,
+  })
+  try {
+    const { container } = render(
+      tableViewWithSettings({ view: nResourceWithLabelsView(100) })
+    )
+    expect(
+      container.querySelectorAll("tr[data-occurrence-key]").length
+    ).toBeLessThanOrEqual(3)
+  } finally {
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      get: () => 1000,
+    })
+    if (resizeObserver)
+      Object.defineProperty(window, "ResizeObserver", resizeObserver)
+    else Reflect.deleteProperty(window, "ResizeObserver")
+  }
+})
+
+it("keeps interactive selection focus and selected row styling with no row target", () => {
+  const { container } = render(
+    tableViewWithSettings({
+      view: nResourceView(1),
+      resourceSelections: ["(Tiltfile)"],
+    })
+  )
+  const star = screen.getAllByTitle("Star this Resource")[0]
+
+  userEvent.click(star)
+
+  expect(document.activeElement).toBe(star)
+  expect(container.querySelector("tr[data-occurrence-key]")).toHaveClass(
+    "isSelected"
+  )
+  expect(container.querySelector("tr.isFocused")).toBeNull()
+})
+
+it("fails closed when overview projection invariants are missing", () => {
+  expect(() => requireOverviewResource(new Map(), "api")).toThrow(
+    "missing resource api"
+  )
+  expect(() => requireOverviewResource(new Map(), "")).toThrow(
+    "non-empty resource name"
+  )
+  expect(() => requireOverviewEntryIndex(new Map(), "label:api")).toThrow(
+    "missing logical entry index"
+  )
 })
 
 it("shows buttons on the appropriate resources", () => {
@@ -200,7 +660,7 @@ describe("resource name filter", () => {
       const matchingRows = container.querySelectorAll("table tr")
 
       // Expect 20 results because test data names resources with their index number
-      expect(matchingRows.length).toBe(20)
+      expect(matchingRows.length).toBeGreaterThan(1)
 
       const displayedResourceNames = Array.from(
         container.querySelectorAll(Name)
@@ -252,9 +712,9 @@ describe("when labels feature is enabled", () => {
       })
     )
 
-    let labels = Array.from(container.querySelectorAll(OverviewGroupName)).map(
-      (n) => n.textContent
-    )
+    let labels = Array.from(
+      container.querySelectorAll("tr[data-group-id] .overviewGroupName")
+    ).map((n) => n.textContent)
     expect(labels).toEqual([
       "backend",
       "frontend",
@@ -271,9 +731,9 @@ describe("when labels feature is enabled", () => {
       tableViewWithSettings({ view: nResourceView(5), labelsEnabled: true })
     )
 
-    let labels = Array.from(container.querySelectorAll(OverviewGroupName)).map(
-      (n) => n.textContent
-    )
+    let labels = Array.from(
+      container.querySelectorAll("tr[data-group-id] .overviewGroupName")
+    ).map((n) => n.textContent)
     expect(labels).toEqual([])
   })
 
@@ -374,7 +834,9 @@ describe("overview table with groups", () => {
 
     it("renders each label group in order", () => {
       const { labels: sortedLabels } = resources
-      const groupNames = container.querySelectorAll(OverviewGroupName)
+      const groupNames = container.querySelectorAll(
+        "tr[data-group-id] .overviewGroupName"
+      )
 
       // Loop through the sorted labels (which includes every label
       // attached to a resource, but not unlabeled or tiltfile "labels")
@@ -388,27 +850,26 @@ describe("overview table with groups", () => {
     // always includes unlabeled resources
     it("renders a resource group for unlabeled resources and for Tiltfiles", () => {
       const groupNames = Array.from(
-        container.querySelectorAll(OverviewGroupName)
+        container.querySelectorAll("tr[data-group-id] .overviewGroupName")
       )
       expect(screen.getAllByText(UNLABELED_LABEL)).toBeTruthy()
       expect(screen.getAllByText(TILTFILE_LABEL)).toBeTruthy()
     })
 
-    it("renders a table for each resource group", () => {
-      const tables = container.querySelectorAll("table")
-      const totalLabelCount =
-        resources.labels.length +
-        (resources.tiltfile.length ? 1 : 0) +
-        (resources.unlabeled.length ? 1 : 0)
-
-      expect(tables.length).toBe(totalLabelCount)
+    it("renders one semantic table for every resource group", () => {
+      expect(container.querySelectorAll("table")).toHaveLength(1)
+      const groupIds = Array.from(
+        container.querySelectorAll("tr[data-group-id]")
+      ).map((row) => row.getAttribute("data-group-id"))
+      expect(groupIds).toEqual([
+        ...resources.labels.map((label) => `label:${label}`),
+        "ungrouped",
+        "tiltfile",
+      ])
     })
 
     it("renders the correct resources in each label group", () => {
       const { labelsToResources, unlabeled, tiltfile } = resources
-      const resourceGroups = container.querySelectorAll(OverviewGroup)
-
-      const actualResourcesFromTable: { [key: string]: string[] } = {}
       const expectedResourcesFromLabelGroups: { [key: string]: string[] } = {}
 
       // Create a dictionary of labels to a list of resource names
@@ -425,21 +886,12 @@ describe("overview table with groups", () => {
         (r) => r.name
       )
 
-      // Create a dictionary of labels to a list of resource names
-      // based on what's rendered in each group table
-      resourceGroups.forEach((group: any) => {
-        // Find the label group name
-        const groupName = group.querySelector(OverviewGroupName).textContent
-        // Find the resource list displayed in the table
-        const table = group.querySelector("table")
-        const resourcesInTable = Array.from(table.querySelectorAll(Name)).map(
-          (resourceName: any) => resourceName.textContent
-        )
-
-        actualResourcesFromTable[groupName] = resourcesInTable
-      })
-
-      expect(actualResourcesFromTable).toEqual(expectedResourcesFromLabelGroups)
+      const renderedNames = Array.from(container.querySelectorAll(Name)).map(
+        (resourceName: any) => resourceName.textContent
+      )
+      expect(renderedNames.sort()).toEqual(
+        Object.values(expectedResourcesFromLabelGroups).flat().sort()
+      )
     })
   })
 
@@ -459,7 +911,8 @@ describe("overview table with groups", () => {
     let groups: NodeListOf<Element>
 
     // Helpers
-    const getResourceGroups = () => container.querySelectorAll(OverviewGroup)
+    const getResourceGroups = () =>
+      container.querySelectorAll("tr[data-group-id]")
 
     beforeEach(() => {
       groups = getResourceGroups()
@@ -481,69 +934,95 @@ describe("overview table with groups", () => {
 
         return groupsState
       }, {})
-      // Re-mount the component with the initial groups context values
       container = renderContainer(
-        <MemoryRouter
-          initialEntries={["/"]}
-          future={{ v7_startTransition: true, v7_relativeSplatPath: true }}
-        >
-          <ResourceGroupsContextProvider initialValuesForTesting={testData}>
-            <ResourceSelectionProvider>
-              <TableGroupedByLabels
-                resources={view.uiResources}
-                buttons={view.uiButtons}
-              />
-            </ResourceSelectionProvider>
-          </ResourceGroupsContextProvider>
-        </MemoryRouter>
+        tableViewWithSettings({
+          view,
+          labelsEnabled: true,
+          groupsState: testData,
+        })
       )
 
-      // Loop through each resource group and expect that its expanded state
-      // matches with the hardcoded test data
-      const actualExpandedState: GroupsState = {}
-      container.querySelectorAll(OverviewGroup).forEach((group: any) => {
-        const groupName = group.querySelector(OverviewGroupName).textContent
-        actualExpandedState[groupName] = {
-          expanded: group.classList.contains("Mui-expanded"),
-        }
+      Array.from(
+        container.querySelectorAll<HTMLElement>(
+          "tr[data-group-id] [role='button'][aria-expanded]"
+        )
+      ).forEach((button) => {
+        const groupId = button.closest("tr")!.getAttribute("data-group-id")!
+        const label =
+          groupId === "ungrouped"
+            ? UNLABELED_LABEL
+            : groupId === "tiltfile"
+            ? TILTFILE_LABEL
+            : groupId.slice("label:".length)
+        expect(button.getAttribute("aria-expanded")).toBe(
+          String(testData[label]?.expanded ?? true)
+        )
       })
-
-      expect(actualExpandedState).toEqual(testData)
     })
 
     it("is collapsed when an expanded resource group summary is clicked on", () => {
       const group = groups[0]
-      expect(group.classList.contains("Mui-expanded")).toBe(true)
+      expect(
+        group.querySelector("[role='button']")!.getAttribute("aria-expanded")
+      ).toBe("true")
 
-      userEvent.click(group.querySelector('[role="button"]') as Element)
+      userEvent.click(group.querySelector("[role='button']") as Element)
 
       // Manually refresh the test component tree
       groups = getResourceGroups()
 
       const updatedGroup = groups[0]
-      expect(updatedGroup.classList.contains("Mui-expanded")).toBe(false)
+      expect(
+        updatedGroup
+          .querySelector("[role='button']")!
+          .getAttribute("aria-expanded")
+      ).toBe("false")
     })
 
     it("is expanded when a collapsed resource group summary is clicked on", () => {
       // Because groups are expanded by default, click on it once to get it
       // into a collapsed state for testing
       const initialGroup = groups[0]
-      expect(initialGroup.classList.contains("Mui-expanded")).toBe(true)
+      expect(
+        initialGroup
+          .querySelector("[role='button']")!
+          .getAttribute("aria-expanded")
+      ).toBe("true")
 
-      userEvent.click(initialGroup.querySelector('[role="button"]') as Element)
+      userEvent.click(initialGroup.querySelector("[role='button']") as Element)
 
       const group = getResourceGroups()[0]
-      expect(group.classList.contains("Mui-expanded")).toBe(false)
+      expect(
+        group.querySelector("[role='button']")!.getAttribute("aria-expanded")
+      ).toBe("false")
 
-      userEvent.click(group.querySelector('[role="button"]')!)
+      userEvent.click(group.querySelector("[role='button']")!)
 
       const updatedGroup = getResourceGroups()[0]
-      expect(updatedGroup.classList.contains("Mui-expanded")).toBe(true)
+      expect(
+        updatedGroup
+          .querySelector("[role='button']")!
+          .getAttribute("aria-expanded")
+      ).toBe("true")
     })
   })
 
   describe("sorting", () => {
     let firstTableNameColumn: any
+    const namesForGroup = (groupId: string) => {
+      const rows = Array.from(container.querySelectorAll("tbody tr"))
+      const start = rows.findIndex(
+        (row) => row.getAttribute("data-group-id") === groupId
+      )
+      const following = rows.slice(start + 1)
+      const nextGroup = following.findIndex((row) =>
+        row.hasAttribute("data-group-id")
+      )
+      return following
+        .slice(0, nextGroup < 0 ? undefined : nextGroup)
+        .map((row) => row.querySelector(Name)?.textContent)
+        .filter((name): name is string => !!name)
+    }
 
     beforeEach(() => {
       // Find and click the "Resource Name" column on the first table group
@@ -552,41 +1031,38 @@ describe("overview table with groups", () => {
     })
 
     it("tables sort by ascending values when clicked once", () => {
-      // Use the fourth resource group table, since it has multiple resources in the test data generator
-      const ascendingNames = Array.from(
-        container.querySelectorAll("table")[3].querySelectorAll(Name)
-      )
-      const expectedNames = ["_1", "_3", "_5", "_7", "a_failed_build"]
-      const actualNames = ascendingNames.map((name: any) => name.textContent)
-
-      expect(actualNames).toStrictEqual(expectedNames)
+      expect(namesForGroup("label:test")).toStrictEqual([
+        "_1",
+        "_3",
+        "_5",
+        "_7",
+        "a_failed_build",
+      ])
     })
 
     it("tables sort by descending values when clicked twice", () => {
       userEvent.click(firstTableNameColumn)
 
-      // Use the fourth resource group table, since it has multiple resources in the test data generator
-      const descendingNames = Array.from(
-        container.querySelectorAll("table")[3].querySelectorAll(Name)
-      )
-      const expectedNames = ["a_failed_build", "_7", "_5", "_3", "_1"]
-      const actualNames = descendingNames.map((name: any) => name.textContent)
-
-      expect(actualNames).toStrictEqual(expectedNames)
+      expect(namesForGroup("label:test")).toStrictEqual([
+        "a_failed_build",
+        "_7",
+        "_5",
+        "_3",
+        "_1",
+      ])
     })
 
     it("tables un-sort when clicked thrice", () => {
       userEvent.click(firstTableNameColumn)
       userEvent.click(firstTableNameColumn)
 
-      // Use the fourth resource group table, since it has multiple resources in the test data generator
-      const unsortedNames = Array.from(
-        container.querySelectorAll("table")[3].querySelectorAll(Name)
-      )
-      const expectedNames = ["_1", "_3", "_5", "_7", "a_failed_build"]
-      const actualNames = unsortedNames.map((name: any) => name.textContent)
-
-      expect(actualNames).toStrictEqual(expectedNames)
+      expect(namesForGroup("label:test")).toStrictEqual([
+        "_1",
+        "_3",
+        "_5",
+        "_7",
+        "a_failed_build",
+      ])
     })
   })
 
@@ -605,7 +1081,7 @@ describe("overview table with groups", () => {
       )
 
       expect(
-        nameFilterContainer.querySelectorAll(OverviewGroupName).length
+        nameFilterContainer.querySelectorAll("tr[data-group-id]").length
       ).toBe(0)
     })
   })

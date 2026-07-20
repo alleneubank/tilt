@@ -21,14 +21,15 @@ let OverviewTablePaneStyle = styled.div`
   flex-direction: column;
   width: 100%;
   height: 100vh;
+  min-height: 0;
+  overflow: hidden;
   background-color: ${Color.gray20};
 `
 
 const OverviewTableStickyNav = styled.div`
   background-color: ${Color.gray20};
-  position: sticky;
-  top: 0;
   z-index: ${ZIndex.TableStickyHeader};
+  flex: 0 0 auto;
 `
 
 const OverviewTableMenu = styled.section`

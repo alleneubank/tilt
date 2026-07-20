@@ -1,25 +1,17 @@
-import {
-  Accordion,
-  AccordionDetails,
-  AccordionSummary,
-} from "@material-ui/core"
 import React, {
-  ChangeEvent,
-  MouseEvent,
-  MutableRefObject,
-  useEffect,
+  useCallback,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react"
+import { flushSync } from "react-dom"
 import {
   HeaderGroup,
   Row,
   SortingRule,
   TableHeaderProps,
-  TableOptions,
   TableState,
-  usePagination,
   useSortBy,
   UseSortByState,
   useTable,
@@ -27,10 +19,6 @@ import {
 import styled from "styled-components"
 import { buildAlerts, runtimeAlerts } from "./alerts"
 import { ApiButtonType, buttonsForComponent } from "./ApiButton"
-import {
-  DEFAULT_RESOURCE_LIST_LIMIT,
-  RESOURCE_LIST_MULTIPLIER,
-} from "./constants"
 import Features, { Flag, useFeatures } from "./feature"
 import { Hold } from "./Hold"
 import {
@@ -46,15 +34,15 @@ import {
   ResourceTableHeaderTip,
   rowIsDisabled,
   RowValues,
+  SelectionCheckbox,
 } from "./OverviewTableColumns"
-import { OverviewTableKeyboardShortcuts } from "./OverviewTableKeyboardShortcuts"
 import {
-  AccordionDetailsStyleResetMixin,
-  AccordionStyleResetMixin,
-  AccordionSummaryStyleResetMixin,
+  OverviewTableKeyboardShortcuts,
+  reconcileOverviewOccurrence,
+} from "./OverviewTableKeyboardShortcuts"
+import {
   ResourceGroupsInfoTip,
   ResourceGroupSummaryIcon,
-  ResourceGroupSummaryMixin,
 } from "./ResourceGroups"
 import { useResourceGroups } from "./ResourceGroupsContext"
 import {
@@ -64,8 +52,17 @@ import {
 import { matchesResourceName } from "./ResourceNameFilter"
 import { useResourceSelection } from "./ResourceSelectionContext"
 import { resourceIsDisabled, resourceTargetType } from "./ResourceStatus"
-import { TableGroupStatusSummary } from "./ResourceStatusSummary"
-import { ShowMoreButton } from "./ShowMoreButton"
+import {
+  ResourceStatusSummaryRoot,
+  TableGroupStatusSummary,
+} from "./ResourceStatusSummary"
+import {
+  buildSidebarVirtualModel,
+  ResourceVirtualEntry,
+  ResourceVirtualGroup,
+  ResourceVirtualResourceEntry,
+} from "./ResourceVirtualModel"
+import { ResourceVirtualWindow } from "./ResourceVirtualWindow"
 import { buildStatus, runtimeStatus } from "./status"
 import { Color, Font, FontSize, SizeUnit } from "./style-helpers"
 import { isZeroTime, timeDiff } from "./time"
@@ -83,22 +80,6 @@ import type { View } from "./webview"
 export type OverviewTableProps = {
   view: View
 }
-
-type TableWrapperProps = {
-  resources?: UIResource[]
-  buttons?: UIButton[]
-}
-
-type TableGroupProps = {
-  label: string
-  setGlobalSortBy: (id: string) => void
-  focused: string
-} & TableOptions<RowValues>
-
-type TableProps = {
-  setGlobalSortBy?: (id: string) => void
-  focused: string
-} & TableOptions<RowValues>
 
 type ResourceTableHeadRowProps = {
   headerGroup: HeaderGroup<RowValues>
@@ -122,10 +103,16 @@ export const NoMatchesFound = styled.p`
 
 // Table styles
 const OverviewTableRoot = styled.section`
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-x: auto;
+  overflow-y: auto;
   padding-bottom: ${SizeUnit(1 / 2)};
+`
+
+const OverviewTableContentRoot = styled.div`
   margin-left: auto;
   margin-right: auto;
-  /* Max and min width are based on fixed table layout and column widths */
   max-width: 2000px;
   min-width: 1400px;
 
@@ -135,30 +122,77 @@ const OverviewTableRoot = styled.section`
   }
 `
 
-const TableWithoutGroupsRoot = styled.div`
-  box-shadow: 0px 4px 4px rgba(0, 0, 0, 0.25);
-  border: 1px ${Color.gray40} solid;
-  border-radius: 0px 0px 8px 8px;
-  background-color: ${Color.gray20};
-`
-
 const ResourceTable = styled.table`
   table-layout: fixed;
   width: 100%;
   border-spacing: 0;
-  border-collapse: collapse;
+  border-collapse: separate;
 
-  td {
+  td,
+  th {
     padding-left: 10px;
     padding-right: 10px;
   }
 
-  td:first-child {
+  td:first-child,
+  th:first-child {
     padding-left: 24px;
   }
 
-  td:last-child {
+  td:last-child,
+  th:last-child {
     padding-right: ${SizeUnit(1)};
+  }
+
+  tbody.overviewGroupBody,
+  tbody.overviewUngroupedBody {
+    background-color: ${Color.gray20};
+  }
+
+  tbody.overviewGroupBody.isExpanded,
+  tbody.overviewUngroupedBody {
+    box-shadow: 0 4px 4px rgba(0, 0, 0, 0.25);
+  }
+
+  tbody.overviewGroupBody,
+  tbody.overviewUngroupedBody {
+    border-bottom-left-radius: ${SizeUnit(1 / 4)};
+    border-bottom-right-radius: ${SizeUnit(1 / 4)};
+  }
+`
+const VirtualSpacerCell = styled.td`
+  border: 0;
+  padding: 0 !important;
+`
+const OverviewGroupSpacerCell = styled(VirtualSpacerCell)`
+  background: transparent !important;
+  box-shadow: none;
+  height: ${SizeUnit(1 / 2)};
+`
+const OverviewGroupSummary = styled.div`
+  align-items: center;
+  background-color: ${Color.gray10};
+  border: 0;
+  color: ${Color.white};
+  display: flex;
+  font-family: ${Font.sansSerif};
+  cursor: pointer;
+  font-size: ${FontSize.default};
+  gap: ${SizeUnit(1 / 4)};
+  margin-top: 0;
+  min-width: 0;
+  padding: ${SizeUnit(1 / 8)};
+  text-align: left;
+  white-space: nowrap;
+
+  &[aria-expanded="true"] ${ResourceGroupSummaryIcon} {
+    transform: rotate(90deg);
+  }
+
+  ${ResourceStatusSummaryRoot} {
+    flex: 0 1 auto;
+    margin-left: auto;
+    white-space: nowrap;
   }
 `
 const ResourceTableHead = styled.thead`
@@ -166,29 +200,80 @@ const ResourceTableHead = styled.thead`
     background-color: ${Color.gray10};
   }
 `
+const GroupedResourceTableHead = styled(ResourceTableHead)`
+  border: 0;
+  clip: rect(0 0 0 0);
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  padding: 0;
+  position: absolute;
+  white-space: nowrap;
+  width: 1px;
+`
 
 export const ResourceTableRow = styled.tr`
-  border-top: 1px solid ${Color.gray40};
+  box-sizing: border-box;
   font-family: ${Font.monospace};
   font-size: ${FontSize.small};
   font-style: none;
   color: ${Color.gray60};
-  padding-top: 6px;
-  padding-bottom: 6px;
-  padding-left: 4px;
+
+  /* Only measured resource rows use the historic 66px density. */
+  &.isResource {
+    height: 4em;
+  }
 
   &.isFocused,
   &:focus {
-    border-left: 4px solid ${Color.blue};
     outline: none;
 
     td:first-child {
-      padding-left: 22px;
+      border-left: 4px solid ${Color.blue};
+      padding-left: 20px;
     }
   }
 
   &.isSelected {
     background-color: ${Color.gray30};
+  }
+
+  /* A group panel is cell-owned so separated table borders keep measured
+   * heights exact while a continuation slice still reads as one surface. */
+  &.isOverviewPanelResource td {
+    background-color: ${Color.gray20};
+  }
+
+  &.isOverviewPanelResource td:first-child {
+    border-left: 1px solid ${Color.gray40};
+  }
+
+  &.isOverviewPanelResource td:last-child {
+    border-right: 1px solid ${Color.gray40};
+  }
+
+  /* Panel fills belong to cells, so restore selection and focus after those
+   * opaque side rules instead of relying on the row's hidden background. */
+  &.isOverviewPanelResource.isSelected td {
+    background-color: ${Color.gray30};
+  }
+
+  &.isOverviewPanelResource.isFocused td:first-child {
+    border-left: 4px solid ${Color.blue};
+    padding-left: 20px;
+  }
+
+  &.isOverviewPanelLastResource td {
+    /* Paint the panel edge without changing this measured row's geometry. */
+    box-shadow: inset 0 -1px 0 ${Color.gray40};
+  }
+
+  &.isOverviewPanelLastResource td:first-child {
+    border-bottom-left-radius: ${SizeUnit(1 / 4)};
+  }
+
+  &.isOverviewPanelLastResource td:last-child {
+    border-bottom-right-radius: ${SizeUnit(1 / 4)};
   }
 
   /* For visual consistency on rows */
@@ -198,6 +283,11 @@ export const ResourceTableRow = styled.tr`
 `
 export const ResourceTableData = styled.td`
   box-sizing: border-box;
+  border-top: 1px solid ${Color.gray40};
+  max-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 
   &.isSorted {
     background-color: ${Color.gray30};
@@ -206,6 +296,25 @@ export const ResourceTableData = styled.td`
   &.alignRight {
     text-align: right;
   }
+
+  &.overviewGroupHeaderCell {
+    background-color: ${Color.gray10};
+    border-left: 1px solid ${Color.gray40};
+    border-right: 1px solid ${Color.gray40};
+    border-top: 1px solid ${Color.gray40};
+    border-top-left-radius: ${SizeUnit(1 / 4)};
+    border-top-right-radius: ${SizeUnit(1 / 4)};
+    max-width: none;
+    overflow: visible;
+    padding: 0 !important;
+    white-space: normal;
+  }
+
+  tbody.isCollapsed &.overviewGroupHeaderCell {
+    border-bottom: 1px solid ${Color.gray40};
+    border-bottom-left-radius: ${SizeUnit(1 / 4)};
+    border-bottom-right-radius: ${SizeUnit(1 / 4)};
+  }
 `
 
 export const ResourceTableHeader = styled(ResourceTableData)`
@@ -213,6 +322,23 @@ export const ResourceTableHeader = styled(ResourceTableData)`
   font-size: ${FontSize.small};
   box-sizing: border-box;
   white-space: nowrap;
+
+  &.isSorted {
+    background-color: ${Color.gray20};
+  }
+`
+const OverviewGroupColumnHeader = styled(ResourceTableHeader)`
+  /* These native headers live in a tbody, so they must own the panel paint
+   * normally inherited from ResourceTableHead. */
+  background-color: ${Color.gray10};
+
+  &:first-child {
+    border-left: 1px solid ${Color.gray40};
+  }
+
+  &:last-child {
+    border-right: 1px solid ${Color.gray40};
+  }
 
   &.isSorted {
     background-color: ${Color.gray20};
@@ -243,40 +369,13 @@ export const ResourceTableHeaderSortTriangle = styled.div`
   }
 `
 
-// Table Group styles
-export const OverviewGroup = styled(Accordion)`
-  ${AccordionStyleResetMixin}
-  color: ${Color.gray50};
-  border: 1px ${Color.gray40} solid;
-  background-color: ${Color.gray20};
-
-  &.MuiAccordion-root,
-  &.MuiAccordion-root.Mui-expanded {
-    margin-top: ${SizeUnit(1 / 2)};
-  }
-
-  &.Mui-expanded {
-    box-shadow: 0px 4px 4px rgba(0, 0, 0, 0.25);
-    border-radius: 0px 0px 8px 8px;
-  }
-`
-
-export const OverviewGroupSummary = styled(AccordionSummary)`
-  ${AccordionSummaryStyleResetMixin}
-  ${ResourceGroupSummaryMixin}
-  background-color: ${Color.gray10};
-
-  .MuiAccordionSummary-content {
-    font-size: ${FontSize.default};
-  }
-`
-
-export const OverviewGroupName = styled.span`
+const OverviewGroupName = styled.span`
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
   padding: 0 ${SizeUnit(1 / 3)};
-`
-
-export const OverviewGroupDetails = styled(AccordionDetails)`
-  ${AccordionDetailsStyleResetMixin}
+  text-overflow: ellipsis;
+  white-space: nowrap;
 `
 
 const GROUP_INFO_TOOLTIP_ID = "table-groups-info"
@@ -565,7 +664,7 @@ export function ResourceTableHeadRow({
   }
 
   return (
-    <ResourceTableRow>
+    <ResourceTableRow className="isHeader" aria-rowindex={1}>
       {headerGroup.headers.map((column) => (
         <ResourceTableHeader
           {...column.getHeaderProps([
@@ -594,269 +693,568 @@ export function ResourceTableHeadRow({
   )
 }
 
-function ShowMoreResourcesRow({
-  colSpan,
-  itemCount,
-  pageSize,
-  onClick,
-}: {
-  colSpan: number
-  itemCount: number
-  pageSize: number
-  onClick: (e: MouseEvent) => void
+/**
+ * Keeps native column associations present while grouped entries are virtualized.
+ * The selection column is intentionally descriptive only: group actions belong
+ * to the expanded group header below, never to every group in one operation.
+ */
+function GroupedSemanticHeaderRow(props: {
+  headerGroup: HeaderGroup<RowValues>
 }) {
-  if (itemCount <= pageSize) {
-    return null
-  }
-
   return (
-    <ResourceTableRow className="isFixedHeight">
-      <ResourceTableData colSpan={colSpan - 2} />
-      <ResourceTableData className="alignRight" colSpan={2}>
-        <ShowMoreButton
-          itemCount={itemCount}
-          currentListSize={pageSize}
-          onClick={onClick}
-        />
-      </ResourceTableData>
-    </ResourceTableRow>
-  )
-}
-
-function TableRow(props: { row: Row<RowValues>; focused: string }) {
-  let { row, focused } = props
-  const { isSelected } = useResourceSelection()
-  let isFocused = row.original.name == focused
-  let rowClasses =
-    (rowIsDisabled(row) ? "isDisabled " : "") +
-    (isSelected(row.original.name) ? "isSelected " : "") +
-    (isFocused ? "isFocused " : "")
-  let ref: MutableRefObject<HTMLTableRowElement | null> = useRef(null)
-
-  useEffect(() => {
-    if (isFocused && ref.current) {
-      ref.current.focus()
-    }
-  }, [isFocused, ref])
-
-  return (
-    <ResourceTableRow
-      tabIndex={-1}
-      ref={ref}
-      {...row.getRowProps({
-        className: rowClasses,
-      })}
-    >
-      {row.cells.map((cell) => (
-        <ResourceTableData
-          {...cell.getCellProps()}
-          className={cell.column.isSorted ? "isSorted" : ""}
-        >
-          {cell.render("Cell")}
-        </ResourceTableData>
+    <ResourceTableRow className="isHeader" aria-rowindex={1}>
+      {props.headerGroup.headers.map((column) => (
+        <ResourceTableHeader as="th" scope="col" {...column.getHeaderProps()}>
+          <ResourceTableHeaderLabel>
+            {column.id === "selection"
+              ? "Resource selection"
+              : column.render("Header")}
+          </ResourceTableHeaderLabel>
+        </ResourceTableHeader>
       ))}
     </ResourceTableRow>
   )
 }
 
-export function Table(props: TableProps) {
-  if (props.data.length === 0) {
-    return null
+/** Mirrors the one global react-table header inside an expanded group surface. */
+function OverviewGroupHeaderRow(props: {
+  headerGroup: HeaderGroup<RowValues>
+  members: ReadonlyArray<Row<RowValues>>
+  setGlobalSortBy: (id: string) => void
+  ariaRowIndex: number
+}) {
+  const calculateToggleProps = (column: HeaderGroup<RowValues>) => {
+    const columnHeader =
+      typeof column.Header === "string"
+        ? column.Header
+        : `${column.id[0]?.toUpperCase()}${column.id?.slice(1)}`
+    return {
+      title: column.canSort ? `Sort by ${columnHeader}` : columnHeader,
+      onClick: column.canSort
+        ? () => props.setGlobalSortBy(column.id)
+        : undefined,
+    }
   }
-
-  const {
-    getTableProps,
-    getTableBodyProps,
-    headerGroups,
-    rows, // Used to calculate the total number of rows
-    page, // Used to render the rows for the current page
-    prepareRow,
-    state: { pageSize },
-    setPageSize,
-  } = useTable(
-    {
-      columns: props.columns,
-      data: props.data,
-      autoResetSortBy: false,
-      useControlledState: props.useControlledState,
-      initialState: { pageSize: DEFAULT_RESOURCE_LIST_LIMIT },
-    },
-    useSortBy,
-    usePagination
-  )
-
-  const showMoreOnClick = () => setPageSize(pageSize * RESOURCE_LIST_MULTIPLIER)
-
-  // TODO (lizz): Consider adding `aria-sort` markup to table headings
   return (
-    <ResourceTable {...getTableProps()}>
-      <ResourceTableHead>
-        {headerGroups.map((headerGroup: HeaderGroup<RowValues>) => (
-          <ResourceTableHeadRow
-            {...headerGroup.getHeaderGroupProps()}
-            headerGroup={headerGroup}
-            setGlobalSortBy={props.setGlobalSortBy}
-          />
-        ))}
-      </ResourceTableHead>
-      <tbody {...getTableBodyProps()}>
-        {page.map((row: Row<RowValues>) => {
-          prepareRow(row)
-          return (
-            <TableRow
-              key={row.original.name}
-              row={row}
-              focused={props.focused}
+    <ResourceTableRow className="isHeader" aria-rowindex={props.ariaRowIndex}>
+      {props.headerGroup.headers.map((column) => (
+        <OverviewGroupColumnHeader
+          as="th"
+          scope="col"
+          {...column.getHeaderProps([
+            { className: column.isSorted ? "isSorted" : "" },
+            column.getSortByToggleProps(calculateToggleProps(column)),
+          ])}
+        >
+          <ResourceTableHeaderLabel>
+            {column.id === "selection" ? (
+              <OverviewGroupSelection members={props.members} />
+            ) : (
+              column.render("Header")
+            )}
+            <ResourceTableHeaderTip id={String(column.id)} />
+            {column.canSort && (
+              <ResourceTableHeaderSortTriangle
+                className={
+                  column.isSorted
+                    ? column.isSortedDesc
+                      ? "is-sorted-desc"
+                      : "is-sorted-asc"
+                    : ""
+                }
+              />
+            )}
+          </ResourceTableHeaderLabel>
+        </OverviewGroupColumnHeader>
+      ))}
+    </ResourceTableRow>
+  )
+}
+
+/** A group action must use the logical members, never the mounted window. */
+function OverviewGroupSelection(props: {
+  members: ReadonlyArray<Row<RowValues>>
+}) {
+  const selection = useResourceSelection()
+  const selectable = props.members
+    .map((row) => row.original)
+    .filter((row) => row.selectable)
+    .map((row) => row.name)
+  if (!selectable.length) return null
+  const checked = selectable.every((name) => selection.isSelected(name))
+  const indeterminate =
+    !checked && selectable.some((name) => selection.isSelected(name))
+  return (
+    <SelectionCheckbox
+      aria-label="Resource group selection"
+      checked={checked}
+      aria-checked={checked}
+      indeterminate={indeterminate}
+      onChange={() =>
+        checked
+          ? selection.deselect(...selectable)
+          : selection.select(...selectable)
+      }
+      size="small"
+    />
+  )
+}
+
+type VirtualOverviewProps = {
+  resources?: UIResource[]
+  buttons?: UIButton[]
+  grouped: boolean
+  scrollOwner: HTMLElement
+  contentOriginVersion: string
+}
+
+export function requireOverviewResource(
+  resources: ReadonlyMap<string, UIResource>,
+  name: string
+): UIResource {
+  if (!name.trim())
+    throw new Error("Overview projection requires a non-empty resource name")
+  const resource = resources.get(name)
+  if (!resource)
+    throw new Error(`Overview projection is missing resource ${name}`)
+  return resource
+}
+
+export function requireOverviewEntryIndex(
+  indices: ReadonlyMap<string, number>,
+  key: string
+): number {
+  const index = indices.get(key)
+  if (index === undefined)
+    throw new Error(
+      `Overview projection is missing logical entry index for ${key}`
+    )
+  return index
+}
+
+/**
+ * The overview owns one react-table sort stream and projects that stream into
+ * one immutable occurrence model. React-table only prepares rows that the
+ * shared window actually mounts.
+ */
+function VirtualOverviewTable(props: VirtualOverviewProps) {
+  const logAlertIndex = useLogAlertIndex()
+  const { getGroup, toggleGroupExpanded } = useResourceGroups()
+  const selection = useResourceSelection()
+  const [sortState, setSortState] = useState<UseSortByState<RowValues>>()
+  const [cursor, setCursor] =
+    useState<
+      import("./OverviewTableKeyboardShortcuts").OverviewOccurrenceCursor
+    >()
+  const [pending, setPending] =
+    useState<
+      import("./OverviewTableKeyboardShortcuts").OverviewOccurrenceCursor
+    >()
+  const contentOriginRef = useRef<HTMLTableSectionElement>(null)
+  const rowsData = useMemo(
+    () =>
+      props.resources?.map((resource) =>
+        uiResourceToCell(resource, props.buttons, logAlertIndex)
+      ) ?? [],
+    [logAlertIndex, props.buttons, props.resources]
+  )
+  const resourceByName = useMemo(
+    () =>
+      new Map(
+        (props.resources ?? []).map((resource) => [
+          resource.metadata?.name ?? "",
+          resource,
+        ])
+      ),
+    [props.resources]
+  )
+  const useControlledState = useCallback(
+    (state: TableState<RowValues>) => ({ ...state, ...sortState }),
+    [sortState]
+  )
+  const { getTableProps, headerGroups, rows, prepareRow } = useTable(
+    {
+      columns: COLUMNS,
+      data: rowsData,
+      autoResetSortBy: false,
+      useControlledState,
+    },
+    useSortBy
+  )
+  const groupState = useMemo(() => {
+    const state: Record<string, boolean> = {}
+    rows.forEach((row) => {
+      const resource = requireOverviewResource(
+        resourceByName,
+        row.original.name
+      )
+      getResourceLabels(resource).forEach(
+        (label) => (state[label] = getGroup(label).expanded)
+      )
+    })
+    state[UNLABELED_LABEL] = getGroup(UNLABELED_LABEL).expanded
+    state[TILTFILE_LABEL] = getGroup(TILTFILE_LABEL).expanded
+    return state
+  }, [getGroup, resourceByName, rows])
+  const model = useMemo(
+    () =>
+      buildSidebarVirtualModel<Row<RowValues>>({
+        items: rows,
+        isDisabled: rowIsDisabled,
+        isTiltfile: (row) => row.original.name === ResourceName.tiltfile,
+        labelsForItem: (row) =>
+          getResourceLabels(
+            requireOverviewResource(resourceByName, row.original.name)
+          ),
+        nameForItem: (row) => row.original.name,
+        // The CSS footprint is intentionally uniform; the key remains a
+        // single class only because all valid cells are clipped to one line.
+        layoutKeyForItem: () => "overview-resource-row",
+        sortLabels: orderLabels,
+        groupState,
+        grouped: props.grouped,
+        partitionDisabled: false,
+        expandSelectedGroup: false,
+        groupCollapsible: () => true,
+        groupHeaderLayoutKey: (group, expanded) => {
+          // Collapsed groups omit their column band, while an expanded group
+          // gains a selection control only when its complete logical members
+          // contain a selectable resource. DOM mounting cannot decide this:
+          // either variant may be the first header calibration.
+          if (!expanded) return "overview-group-header-collapsed"
+          return `overview-group-header-expanded-${
+            group.members.some((row) => row.original.selectable)
+              ? "selectable"
+              : "text-only"
+          }`
+        },
+      }),
+    [groupState, props.grouped, resourceByName, rows]
+  )
+  useLayoutEffect(() => {
+    setCursor((current) =>
+      reconcileOverviewOccurrence(model.logicalResources, current)
+    )
+    setPending((current) =>
+      reconcileOverviewOccurrence(model.logicalResources, current)
+    )
+  }, [model.logicalResources])
+  const requestOccurrence = useCallback(
+    (entry: ResourceVirtualResourceEntry<Row<RowValues>>) => {
+      const group = model.groups.get(entry.groupId)
+      flushSync(() => {
+        if (group && !group.expanded) toggleGroupExpanded(group.label)
+        const next = {
+          occurrenceKey: entry.occurrenceKey,
+          resourceName: entry.resourceName,
+        }
+        setCursor(next)
+        setPending(next)
+      })
+    },
+    [model.groups, toggleGroupExpanded]
+  )
+  const targetKey =
+    pending &&
+    model.entries.some(
+      (entry) =>
+        entry.kind === "resource" &&
+        entry.occurrenceKey === pending.occurrenceKey
+    )
+      ? pending.occurrenceKey
+      : undefined
+  const setGlobalSortBy = (id: string) =>
+    setSortState((current) => ({
+      sortBy: calculateNextSort(id, current?.sortBy),
+    }))
+  const entryIndex = new Map(
+    model.entries.map((entry, index) => [
+      entry.kind === "resource"
+        ? entry.occurrenceKey
+        : entry.kind === "group-header"
+        ? `group:${entry.groupId}`
+        : `disabled:${entry.sectionId}`,
+      index,
+    ])
+  )
+  const ariaRowIndex = (entry: ResourceVirtualEntry<Row<RowValues>>) => {
+    const key =
+      entry.kind === "resource"
+        ? entry.occurrenceKey
+        : entry.kind === "group-header"
+        ? `group:${entry.groupId}`
+        : `disabled:${entry.sectionId}`
+    const index = requireOverviewEntryIndex(entryIndex, key)
+    if (!props.grouped) return index + 2
+    return (
+      2 +
+      model.entries.slice(0, index).reduce((count, preceding) => {
+        return (
+          count +
+          1 +
+          (preceding.kind === "group-header" && preceding.expanded ? 1 : 0)
+        )
+      }, 0)
+    )
+  }
+  const groupedAriaRowCount = model.entries.reduce(
+    (count, entry) =>
+      count + 1 + (entry.kind === "group-header" && entry.expanded ? 1 : 0),
+    0
+  )
+  const renderEntry = (
+    entry: ResourceVirtualEntry<Row<RowValues>>,
+    onElement: (element: HTMLElement | null) => void
+  ) => {
+    const entryKey =
+      entry.kind === "resource"
+        ? entry.occurrenceKey
+        : entry.kind === "group-header"
+        ? `group:${entry.groupId}`
+        : `disabled:${entry.sectionId}`
+    const index = requireOverviewEntryIndex(entryIndex, entryKey)
+    if (entry.kind === "resource") {
+      const row = entry.item
+      const group = model.groups.get(entry.groupId)
+      if (!group)
+        throw new Error(
+          `Overview projection is missing group ${entry.groupId} for ${entry.occurrenceKey}`
+        )
+      prepareRow(row)
+      const focused = cursor?.occurrenceKey === entry.occurrenceKey
+      const classes =
+        "isResource " +
+        "isOverviewPanelResource " +
+        (entry.groupIndex === group.members.length - 1
+          ? "isOverviewPanelLastResource isOverviewGroupLastResource "
+          : "") +
+        (rowIsDisabled(row) ? "isDisabled " : "") +
+        (selection.isSelected(row.original.name) ? "isSelected " : "") +
+        (focused ? "isFocused " : "")
+      return (
+        <ResourceTableRow
+          {...row.getRowProps({ className: classes })}
+          id={`overview-resource-${encodeURIComponent(entry.occurrenceKey)}`}
+          data-occurrence-key={entry.occurrenceKey}
+          aria-rowindex={ariaRowIndex(entry)}
+          tabIndex={-1}
+          ref={onElement as React.Ref<HTMLTableRowElement>}
+        >
+          {row.cells.map((cell) => (
+            <ResourceTableData
+              {...cell.getCellProps()}
+              className={cell.column.isSorted ? "isSorted" : ""}
+            >
+              {cell.render("Cell")}
+            </ResourceTableData>
+          ))}
+        </ResourceTableRow>
+      )
+    }
+    if (entry.kind === "group-header") {
+      const label =
+        entry.label === UNLABELED_LABEL ? <em>{entry.label}</em> : entry.label
+      return (
+        <tbody
+          ref={onElement as React.Ref<HTMLTableSectionElement>}
+          data-overview-group-header={entry.groupId}
+          className={`overviewGroupHeaderBody ${
+            entry.expanded ? "isExpanded" : "isCollapsed"
+          }`}
+        >
+          <tr aria-hidden="true">
+            <OverviewGroupSpacerCell
+              className="overviewGroupSpacerCell"
+              colSpan={COLUMNS.length}
+              aria-hidden="true"
             />
-          )
-        })}
-        <ShowMoreResourcesRow
-          itemCount={rows.length}
-          pageSize={pageSize}
-          onClick={showMoreOnClick}
-          colSpan={props.columns.length}
-        />
+          </tr>
+          <ResourceTableRow
+            aria-rowindex={ariaRowIndex(entry)}
+            data-group-id={entry.groupId}
+          >
+            <ResourceTableData
+              className="overviewGroupHeaderCell"
+              colSpan={COLUMNS.length}
+            >
+              <OverviewGroupSummary
+                className="overviewGroupSummary"
+                id={`overview-group-control-${encodeURIComponent(
+                  entry.groupId
+                )}`}
+                role="button"
+                tabIndex={0}
+                aria-expanded={entry.expanded}
+                aria-controls={`overview-group-${encodeURIComponent(
+                  entry.groupId
+                )}`}
+                onClick={() => toggleGroupExpanded(entry.label)}
+                onKeyDown={(event) => {
+                  if (event.key !== "Enter" && event.key !== " ") return
+                  event.preventDefault()
+                  toggleGroupExpanded(entry.label)
+                }}
+              >
+                <ResourceGroupSummaryIcon role="presentation" />
+                <OverviewGroupName className="overviewGroupName">
+                  {label}
+                </OverviewGroupName>
+                <TableGroupStatusSummary
+                  labelText={`Status summary for ${entry.label} group`}
+                  resources={[...entry.members].map((row) => row.original)}
+                />
+              </OverviewGroupSummary>
+            </ResourceTableData>
+          </ResourceTableRow>
+          {entry.expanded && (
+            <OverviewGroupHeaderRow
+              headerGroup={headerGroups[0]}
+              members={entry.members}
+              setGlobalSortBy={setGlobalSortBy}
+              ariaRowIndex={ariaRowIndex(entry) + 1}
+            />
+          )}
+        </tbody>
+      )
+    }
+    throw new Error(
+      `Overview projection cannot render disabled-header ${entry.sectionId}; partitionDisabled must remain false`
+    )
+  }
+  const renderEntries = (
+    entries: ReadonlyArray<ResourceVirtualEntry<Row<RowValues>>>,
+    render: (
+      entry: ResourceVirtualEntry<Row<RowValues>>,
+      onElement: (element: HTMLElement | null) => void
+    ) => React.ReactNode
+  ) => {
+    const groups: Array<{
+      groupId: string
+      group: ResourceVirtualGroup<Row<RowValues>>
+      entries: ResourceVirtualEntry<Row<RowValues>>[]
+    }> = []
+    entries.forEach((entry) => {
+      const groupId = entry.groupId
+      const modelGroup = model.groups.get(groupId)
+      if (!modelGroup)
+        throw new Error(
+          `Overview projection is missing group ${groupId} while rendering its rowgroup`
+        )
+      const previous = groups[groups.length - 1]
+      if (!previous || previous.groupId !== groupId)
+        groups.push({ groupId, group: modelGroup, entries: [entry] })
+      else previous.entries.push(entry)
+    })
+    return groups.map((group) => {
+      const header = group.entries.find(
+        (
+          entry
+        ): entry is ResourceVirtualEntry<Row<RowValues>> & {
+          kind: "group-header"
+        } => entry.kind === "group-header"
+      )
+      const resources = group.entries.filter(
+        (entry): entry is ResourceVirtualResourceEntry<Row<RowValues>> =>
+          entry.kind === "resource"
+      )
+      return (
+        <React.Fragment key={group.groupId}>
+          {header && render(header, () => {})}
+          {(header || resources.length > 0) && (
+            <tbody
+              id={`overview-group-${encodeURIComponent(group.groupId)}`}
+              role="rowgroup"
+              aria-label={
+                props.grouped ? `${group.group.label} resources` : "Resources"
+              }
+              className={
+                props.grouped
+                  ? `overviewGroupBody ${
+                      group.group.expanded ? "isExpanded" : "isCollapsed"
+                    }`
+                  : "overviewUngroupedBody"
+              }
+            >
+              {resources.map((entry) => (
+                <React.Fragment key={entry.occurrenceKey}>
+                  {render(entry, () => {})}
+                </React.Fragment>
+              ))}
+            </tbody>
+          )}
+        </React.Fragment>
+      )
+    })
+  }
+  return (
+    <ResourceTable
+      {...getTableProps()}
+      className={props.grouped ? undefined : "isUngroupedOverview"}
+      aria-rowcount={
+        props.grouped ? groupedAriaRowCount + 1 : model.entries.length + 1
+      }
+    >
+      <colgroup>
+        {headerGroups[0].headers.map((column) => (
+          <col key={column.id} style={{ width: column.width }} />
+        ))}
+      </colgroup>
+      {props.grouped ? (
+        <GroupedResourceTableHead>
+          <GroupedSemanticHeaderRow headerGroup={headerGroups[0]} />
+        </GroupedResourceTableHead>
+      ) : (
+        <ResourceTableHead>
+          {headerGroups.map((headerGroup) => (
+            <ResourceTableHeadRow
+              {...headerGroup.getHeaderGroupProps()}
+              headerGroup={headerGroup}
+              setGlobalSortBy={setGlobalSortBy}
+            />
+          ))}
+        </ResourceTableHead>
+      )}
+      <tbody ref={contentOriginRef} aria-hidden="true">
+        <tr>
+          <VirtualSpacerCell colSpan={COLUMNS.length} style={{ height: 0 }} />
+        </tr>
       </tbody>
+      <ResourceVirtualWindow
+        entries={model.entries}
+        scrollOwnerRef={{ current: props.scrollOwner }}
+        contentOriginRef={contentOriginRef}
+        contentOriginVersion={`${props.contentOriginVersion}:${props.grouped}:${model.entries.length}`}
+        targetKey={targetKey}
+        onTargetMounted={(key, element) => {
+          if (key !== pending?.occurrenceKey) return
+          element.focus()
+          setPending((current) =>
+            current?.occurrenceKey === key ? undefined : current
+          )
+        }}
+        asFragment
+        renderEntries={renderEntries}
+        renderEntry={renderEntry}
+        renderSpacer={(height, position) => (
+          <tbody aria-hidden="true" data-virtual-spacer={position}>
+            <tr>
+              <VirtualSpacerCell colSpan={COLUMNS.length} style={{ height }} />
+            </tr>
+          </tbody>
+        )}
+      />
+      <OverviewTableKeyboardShortcuts
+        items={model.logicalResources}
+        cursor={pending ?? cursor}
+        onRequestOccurrence={requestOccurrence}
+      />
     </ResourceTable>
   )
 }
 
-function TableGroup(props: TableGroupProps) {
-  const { label, ...tableProps } = props
-
-  if (tableProps.data.length === 0) {
-    return null
-  }
-
-  const formattedLabel = label === UNLABELED_LABEL ? <em>{label}</em> : label
-  const labelNameId = `tableOverview-${label}`
-
-  const { getGroup, toggleGroupExpanded } = useResourceGroups()
-  const { expanded } = getGroup(label)
-  const handleChange = (_e: ChangeEvent<{}>) => toggleGroupExpanded(label)
-
-  return (
-    <OverviewGroup expanded={expanded} onChange={handleChange}>
-      <OverviewGroupSummary id={labelNameId}>
-        <ResourceGroupSummaryIcon role="presentation" />
-        <OverviewGroupName>{formattedLabel}</OverviewGroupName>
-        <TableGroupStatusSummary
-          labelText={`Status summary for ${label} group`}
-          resources={tableProps.data}
-        />
-      </OverviewGroupSummary>
-      <OverviewGroupDetails>
-        <Table {...tableProps} />
-      </OverviewGroupDetails>
-    </OverviewGroup>
-  )
-}
-
-export function TableGroupedByLabels({
-  resources,
-  buttons,
-}: TableWrapperProps) {
-  const features = useFeatures()
-  const logAlertIndex = useLogAlertIndex()
-  const data = useMemo(
-    () => labeledResourcesToTableCells(resources, buttons, logAlertIndex),
-    [resources, buttons]
-  )
-
-  const totalOrder = useMemo(() => {
-    let totalOrder = []
-    data.labels.forEach((label) =>
-      totalOrder.push(...enabledRowsFirst(data.labelsToResources[label]))
-    )
-    totalOrder.push(...enabledRowsFirst(data.unlabeled))
-    totalOrder.push(...enabledRowsFirst(data.tiltfile))
-    return totalOrder
-  }, [data])
-  let [focused, setFocused] = useState("")
-
-  // Global table settings are currently used to sort multiple
-  // tables by the same column
-  // See: https://react-table.tanstack.com/docs/faq#how-can-i-manually-control-the-table-state
-  const [globalTableSettings, setGlobalTableSettings] =
-    useState<UseSortByState<RowValues>>()
-
-  const useControlledState = (state: TableState<RowValues>) =>
-    useMemo(() => {
-      return { ...state, ...globalTableSettings }
-    }, [state, globalTableSettings])
-
-  const setGlobalSortBy = (columnId: string) => {
-    const sortBy = calculateNextSort(columnId, globalTableSettings?.sortBy)
-    setGlobalTableSettings({ sortBy })
-  }
-
-  return (
-    <>
-      {data.labels.map((label) => (
-        <TableGroup
-          key={label}
-          label={label}
-          data={data.labelsToResources[label]}
-          columns={COLUMNS}
-          useControlledState={useControlledState}
-          setGlobalSortBy={setGlobalSortBy}
-          focused={focused}
-        />
-      ))}
-      <TableGroup
-        label={UNLABELED_LABEL}
-        data={data.unlabeled}
-        columns={COLUMNS}
-        useControlledState={useControlledState}
-        setGlobalSortBy={setGlobalSortBy}
-        focused={focused}
-      />
-      <TableGroup
-        label={TILTFILE_LABEL}
-        data={data.tiltfile}
-        columns={COLUMNS}
-        useControlledState={useControlledState}
-        setGlobalSortBy={setGlobalSortBy}
-        focused={focused}
-      />
-      <OverviewTableKeyboardShortcuts
-        focused={focused}
-        setFocused={setFocused}
-        rows={totalOrder}
-      />
-    </>
-  )
-}
-
-export function TableWithoutGroups({ resources, buttons }: TableWrapperProps) {
-  const features = useFeatures()
-  const logAlertIndex = useLogAlertIndex()
-  const data = useMemo(() => {
-    return (
-      resources?.map((r) => uiResourceToCell(r, buttons, logAlertIndex)) || []
-    )
-  }, [resources, buttons])
-
-  let totalOrder = useMemo(() => enabledRowsFirst(data), [data])
-  let [focused, setFocused] = useState("")
-
-  if (resources?.length === 0) {
-    return null
-  }
-
-  return (
-    <TableWithoutGroupsRoot>
-      <Table columns={COLUMNS} data={data} focused={focused} />
-      <OverviewTableKeyboardShortcuts
-        focused={focused}
-        setFocused={setFocused}
-        rows={totalOrder}
-      />
-    </TableWithoutGroupsRoot>
-  )
-}
-
-function OverviewTableContent(props: OverviewTableProps) {
+function OverviewTableContent(
+  props: OverviewTableProps & { scrollOwner?: HTMLElement }
+) {
   const features = useFeatures()
   const labelsEnabled = features.isEnabled(Flag.Labels)
   const resourcesHaveLabels =
@@ -878,40 +1276,45 @@ function OverviewTableContent(props: OverviewTableProps) {
   const displayResourceGroups =
     labelsEnabled && resourcesHaveLabels && !resourceFilterApplied
 
-  if (displayResourceGroups) {
-    return (
-      <TableGroupedByLabels
-        resources={resourcesToDisplay}
-        buttons={props.view.uiButtons}
-      />
-    )
-  } else {
-    // The label group tip is only displayed if labels are enabled but not used
-    const displayLabelGroupsTip = labelsEnabled && !resourcesHaveLabels
-
+  if (props.scrollOwner) {
     return (
       <>
-        {displayLabelGroupsTip && (
+        {!displayResourceGroups && labelsEnabled && !resourcesHaveLabels && (
           <ResourceGroupsInfoTip idForIcon={GROUP_INFO_TOOLTIP_ID} />
         )}
-        <TableResourceResultCount resources={resourcesToDisplay} />
-        <TableNoMatchesFound resources={resourcesToDisplay} />
-        <TableWithoutGroups
-          aria-describedby={
-            displayLabelGroupsTip ? GROUP_INFO_TOOLTIP_ID : undefined
-          }
-          resources={resourcesToDisplay}
-          buttons={props.view.uiButtons}
-        />
+        {!displayResourceGroups && (
+          <>
+            <TableResourceResultCount resources={resourcesToDisplay} />
+            <TableNoMatchesFound resources={resourcesToDisplay} />
+          </>
+        )}
+        {resourcesToDisplay.length > 0 && (
+          <VirtualOverviewTable
+            resources={resourcesToDisplay}
+            buttons={props.view.uiButtons}
+            grouped={displayResourceGroups}
+            scrollOwner={props.scrollOwner}
+            contentOriginVersion={`${resourceFilterApplied}:${resourcesToDisplay.length}`}
+          />
+        )}
       </>
     )
   }
+  // The parent ref commits before this state update; never render a
+  // pre-window fallback that could briefly materialize every occurrence.
+  return null
 }
 
 export default function OverviewTable(props: OverviewTableProps) {
+  const [ownerElement, setOwnerElement] = useState<HTMLElement>()
+  const setOwner = useCallback((element: HTMLElement | null) => {
+    setOwnerElement(element ?? undefined)
+  }, [])
   return (
-    <OverviewTableRoot aria-label="Resources overview">
-      <OverviewTableContent {...props} />
+    <OverviewTableRoot aria-label="Resources overview" ref={setOwner}>
+      <OverviewTableContentRoot>
+        <OverviewTableContent {...props} scrollOwner={ownerElement} />
+      </OverviewTableContentRoot>
     </OverviewTableRoot>
   )
 }
