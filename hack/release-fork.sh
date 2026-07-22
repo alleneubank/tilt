@@ -34,7 +34,18 @@ PUBLISH=false
 # and the short SHA makes every build uniquely traceable to a commit. The `g`
 # prefix keeps the SHA segment non-numeric so it can never trip SemVer's
 # "no leading zero in a numeric identifier" rule.
-BASE="$(git describe --tags --abbrev=0 --match 'v[0-9]*' | sed 's/^v//')"
+# Nearest *upstream* semver tag only — never a prior -fork release, or BASE
+# stacks as 0.37.5-fork.<date>.g<sha>-fork.<date2>.g...
+BASE="$(
+  git tag -l 'v[0-9]*' --sort=-v:refname \
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+    | head -1 \
+    | sed 's/^v//'
+)"
+if [[ -z "$BASE" ]]; then
+  echo "error: no upstream-style vX.Y.Z tag found for BASE" >&2
+  exit 1
+fi
 DATE="$(date -u +%Y%m%d)"
 SHA="$(git rev-parse --short=9 HEAD)"
 FULL_SHA="$(git rev-parse HEAD)"
