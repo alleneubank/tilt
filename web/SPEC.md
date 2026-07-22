@@ -37,22 +37,26 @@ EventDispatch together — the single highest-leverage lever the profile
 supports. Store/data-layer diffing is explicitly out of scope (second-order:
 JS cost is diffuse with no hot spot; see Non-goals).
 
-## Domain model (current, evidence-based)
+## Domain model (current)
 
 ```
 websocket view-stream
   └─ LogStore (web/src/LogStore.ts)
        segments + spans, byte-capped at maxLogLength = 2 MB → truncate to 1 MB
        checkpoints for incremental readers; update listeners
-         └─ OverviewLogComponent (web/src/OverviewLogPane.tsx:183)
+         └─ OverviewLogComponent (web/src/OverviewLogPane.tsx)
               React class shell around an imperative raw-DOM renderer
-              forwardBuffer/backwardBuffer + rAF-paced appends (250 lines/frame)
-              autoscroll flag (scroll-up disengages, bottom re-engages)
+              dual buffers: forwardBuffer (newer, off-DOM) / backwardBuffer (older)
+              rAF-paced mount of up to renderedLineLimit (750) lines; eviction of
+              opposite edge when growing a direction
+              follow mode (autoscroll): compact geometry-aware tail only
+              history mode: hydrate full logical index; freeze reader window until
+              deliberate return-to-tail (REQ-LOGPANE-007)
+              Live control + End key force rejoin; leave hysteresis on scroll-up
               alert-nav buttons, prefixes, ANSI/level styling per line
-              NO eviction: rendered DOM grows to full store history
   └─ filters (web/src/logfilters.ts): level / source / term (regex) —
        evaluated against store lines, upstream of rendering
-  └─ Copy Logs (web/src/CopyLogs.tsx:34–58): reads LogStore, not the DOM
+  └─ Copy Logs (web/src/CopyLogs.tsx): reads LogStore, not the DOM
 ```
 
 ## Requirements
@@ -61,20 +65,20 @@ websocket view-stream
 
 - **REQ-LOGPANE-001 — Bounded rendered DOM.** At any instant the pane holds
   O(window) rendered line elements, independent of store-held history size.
-  Off-window lines are evicted from the DOM. (Today `renderWindow` only paces
-  appends; nothing is ever removed.)
-  → floors: median DOM nodes ≤ baseline × 1.15 (expected to drop sharply);
+  Off-window lines are evicted from the DOM. Peak `.LogLine` count ≤ **750**.
+  → floors: median DOM nodes ≤ baseline × 1.15; `e2e:log-pane` max-rendered-lines;
   raw-duration floors below.
 - **REQ-LOGPANE-002 — Full history reachable.** Scrolling reaches every line
   the store holds (back to the truncation point). Jump-to-line
   (`scrollToStoredLineIndex`) and alert-nav land on their target line even
   when it is off-window at click time.
   → floor: correctness E2E green (INV-5 of tilt-web-perf).
-- **REQ-LOGPANE-003 — Follow-mode parity.** Autoscroll semantics are unchanged:
-  pinned-to-tail by default, scroll-up disengages, scroll-to-bottom re-engages,
-  new tail lines render while pinned. After a font-scale shrink **in follow
-  mode**, the pane remains viewport-filled (Probe A): the follow tail is not
-  stuck at the fixed `tailLineLimit` when measured geometry requires more lines.
+- **REQ-LOGPANE-003 — Follow-mode parity.** Pinned-to-tail by default; scroll-up
+  disengages (with hysteresis, REQ-LOGPANE-007); near-bottom scroll or Live/End
+  re-engages; new tail lines render while pinned. After a font-scale shrink **in
+  follow mode**, the pane remains viewport-filled (Probe A): the follow tail is
+  not stuck at the fixed `tailLineLimit` when measured geometry requires more
+  lines.
   → floor: quiet Probe A/A2/B and correctness E2E green.
 - **REQ-LOGPANE-003a — Geometry-aware follow tail.** One immutable per-render
   tail-limit snapshot is captured at the top of `renderBuffer()` and applied to
@@ -101,26 +105,31 @@ websocket view-stream
   render cost is O(new lines + window), never O(history) — the store-checkpoint
   incremental read path is preserved; no full re-render per log frame.
   → floors: raw-duration no-regression on the sustained cells.
-- **REQ-LOGPANE-007 — Return-to-tail (M5.1).** After the user leaves follow mode
+- **REQ-LOGPANE-007 — Return-to-tail.** After the user leaves follow mode
   (history excursion or accidental upward flick), they can reach the live store
   tail without trapping on a short rendered window:
   1. **Bottom-edge forward paging / rejoin.** Scrolling to (or within a small
-     proximity of) the bottom of the rendered pane pages newer lines from the
-     off-DOM forward buffer and re-engages follow when the live tail is
+     proximity of) the bottom of an **overflowing** pane pages newer lines from
+     the off-DOM forward buffer and re-engages follow when the live tail is
      reachable; a large unrendered forward gap may coalesce to the live tail
-     under follow (same coalesce path as pinned mode).
+     under follow (same coalesce path as pinned mode). Non-overflowing
+     geometry (underfill: `scrollHeight ≤ clientHeight`) is **not** "near
+     bottom" — underfill refill must not force-rejoin follow.
   2. **Explicit Live control.** A visible "Live" affordance (and End when the
      pane owns focus) forces follow and scrolls to the live cursor regardless of
-     partial geometry.
+     partial geometry. Live visibility tracks follow mode and survives parent
+     React re-renders (HUD view-stream updates).
   3. **Leave hysteresis.** Sub-threshold upward scroll deltas do not disengage
      follow (top-boundary history requests still load older windows).
-  4. **Expand-on-disengage (should).** First deliberate leave from a compact
-     follow tail expands the mounted window toward the ordinary history cap so
-     there is scroll runway to return.
-  Peak rendered `.LogLine` elements remain ≤ **750**. Not a full continuous
-  virtual-list redesign (M6).
+  4. **Expand-on-disengage.** Expanding the mounted window for scroll runway
+     runs only on **top-boundary** history hydrate, not on mid-window leave, so
+     a frozen history window keeps its visible identities until the reader
+     moves deliberately.
+  Peak rendered `.LogLine` elements remain ≤ **750**. Not a continuous
+  virtual-list redesign (M6 non-goal).
   → floors: `OverviewLogPane` unit tests for forward page, Live/rejoin,
-  hysteresis, and ≤750; `e2e:log-pane` return-to-tail journey green.
+  hysteresis, underfill-vs-near-bottom, and ≤750; `e2e:log-pane` return-to-tail
+  journey green.
 
 ### Perf gates (all on release-equivalent builds, via tilt-web-perf `run-map.sh`)
 
@@ -206,7 +215,9 @@ websocket view-stream
 - [x] Pre-M5 baselines captured on the new fixtures; map-wide raw-duration and
       busy-resource memory red reproduced (REQ-FIX-004)
 - [x] Virtualized pane lands; `OverviewLogPane` and `LogStore` coverage plus
-      the correctness E2E are green (REQ-LOGPANE-001..006, 003a).
+      the correctness E2E are green (REQ-LOGPANE-001..007, 003a).
+- [x] Return-to-tail works under load: near-bottom rejoin / Live, ≤750 lines
+      (`e2e:log-pane` return-to-tail journey; REQ-LOGPANE-007).
 - [x] The release build meets the reproducible M5 absolutes: cold-start raw
       long-task duration ≤ 492 ms, all-logs-firehose raw long-task duration ≤
       778 ms, and busy-resource retained heap slope ≤ 5 MB/min (REQ-PERF-001).
@@ -239,10 +250,11 @@ accepted, store-side regex filter covers the find workflow (Decisions #4).
 5. **Fixture source**: hermetic k3d + `hack/log-only-podmonitor`; steady +
    true-burst recordings; shared localnets retired as recording sources.
 6. **M6 wishlist** captured under Non-goals.
-7. **M5.1 return-to-tail (2026-07-22):** fix sticky return under the existing
-   dual-buffer virtualization (REQ-LOGPANE-007); do not wait on M6 redesign.
-   Must: bottom-edge forward paging/rejoin, Live control, leave hysteresis.
-   Should: expand-on-disengage. Never raise the 750-line cap.
+7. **Return-to-tail under dual-buffer virtualization** (REQ-LOGPANE-007):
+   near-bottom rejoin and Live/End on the existing model; no continuous
+   virtual-list rewrite; never raise the 750-line cap. Expand runway only at
+   top-boundary hydrate; underfill is not near-bottom; Live survives parent
+   re-renders.
 
 The same batch is appended to tilt-web-perf `BRIEF.md` Decisions.
 
