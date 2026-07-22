@@ -101,6 +101,26 @@ websocket view-stream
   render cost is O(new lines + window), never O(history) — the store-checkpoint
   incremental read path is preserved; no full re-render per log frame.
   → floors: raw-duration no-regression on the sustained cells.
+- **REQ-LOGPANE-007 — Return-to-tail (M5.1).** After the user leaves follow mode
+  (history excursion or accidental upward flick), they can reach the live store
+  tail without trapping on a short rendered window:
+  1. **Bottom-edge forward paging / rejoin.** Scrolling to (or within a small
+     proximity of) the bottom of the rendered pane pages newer lines from the
+     off-DOM forward buffer and re-engages follow when the live tail is
+     reachable; a large unrendered forward gap may coalesce to the live tail
+     under follow (same coalesce path as pinned mode).
+  2. **Explicit Live control.** A visible "Live" affordance (and End when the
+     pane owns focus) forces follow and scrolls to the live cursor regardless of
+     partial geometry.
+  3. **Leave hysteresis.** Sub-threshold upward scroll deltas do not disengage
+     follow (top-boundary history requests still load older windows).
+  4. **Expand-on-disengage (should).** First deliberate leave from a compact
+     follow tail expands the mounted window toward the ordinary history cap so
+     there is scroll runway to return.
+  Peak rendered `.LogLine` elements remain ≤ **750**. Not a full continuous
+  virtual-list redesign (M6).
+  → floors: `OverviewLogPane` unit tests for forward page, Live/rejoin,
+  hysteresis, and ≤750; `e2e:log-pane` return-to-tail journey green.
 
 ### Perf gates (all on release-equivalent builds, via tilt-web-perf `run-map.sh`)
 
@@ -219,6 +239,10 @@ accepted, store-side regex filter covers the find workflow (Decisions #4).
 5. **Fixture source**: hermetic k3d + `hack/log-only-podmonitor`; steady +
    true-burst recordings; shared localnets retired as recording sources.
 6. **M6 wishlist** captured under Non-goals.
+7. **M5.1 return-to-tail (2026-07-22):** fix sticky return under the existing
+   dual-buffer virtualization (REQ-LOGPANE-007); do not wait on M6 redesign.
+   Must: bottom-edge forward paging/rejoin, Live control, leave hysteresis.
+   Should: expand-on-disengage. Never raise the 750-line cap.
 
 The same batch is appended to tilt-web-perf `BRIEF.md` Decisions.
 
@@ -250,7 +274,7 @@ The REQ-FIX-004 check produced the accepted red. Facts (release build
 
 | Requirement | Primary proof |
 | --- | --- |
-| REQ-LOGPANE-001..006, 003a | `LogStore.test.ts`, `OverviewLogPane.test.tsx`, quiet Probe A/A2/B, `e2e:log-pane` |
+| REQ-LOGPANE-001..007, 003a | `LogStore.test.ts`, `OverviewLogPane.test.tsx`, quiet Probe A/A2/B, `e2e:log-pane` |
 | REQ-HUDPERF-001..002 | range/window tests; `e2e:hud-scale` global mounted bounds |
 | REQ-HUDPERF-003 | `e2e:hud-scale` far-tail exact-filter/direct-route reachability; model, scroll, keyboard, a11y tests |
 | REQ-HUDPERF-004..006 | model, scroll, keyboard, a11y component tests (including missing-`ResizeObserver` fallback) |

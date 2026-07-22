@@ -10,11 +10,15 @@ import {
 } from "./logfilters"
 import LogStore, { LogUpdateAction, LogStoreProvider } from "./LogStore"
 import OverviewLogPane, {
+  isNearScrollBottom,
+  leaveFollowHysteresisPx,
   liveLogReadIntervalMs,
   OverviewLogComponent,
   PROLOGUE_LENGTH,
   renderedLineLimit,
   renderWindow,
+  returnToTailProximityPx,
+  shouldLeaveFollowOnScrollUp,
   tailLineLimit,
 } from "./OverviewLogPane"
 import { LogDisplay } from "./logs"
@@ -44,6 +48,30 @@ function customRender(component: JSX.Element, options?: RenderOptions) {
     ...options,
   })
 }
+
+describe("return-to-tail geometry helpers", () => {
+  it("isNearScrollBottom is true within proximity of max scroll", () => {
+    expect(isNearScrollBottom(952, 1000, 40, returnToTailProximityPx)).toBe(
+      true
+    )
+    expect(isNearScrollBottom(900, 1000, 40, returnToTailProximityPx)).toBe(
+      false
+    )
+    // Non-overflow (underfill) is never "near bottom" for return-to-tail.
+    expect(isNearScrollBottom(0, 40, 40, returnToTailProximityPx)).toBe(false)
+    expect(isNearScrollBottom(0, 0, 0, returnToTailProximityPx)).toBe(false)
+  })
+
+  it("shouldLeaveFollowOnScrollUp ignores sub-hysteresis upward deltas", () => {
+    expect(
+      shouldLeaveFollowOnScrollUp(100, 100 - (leaveFollowHysteresisPx - 1))
+    ).toBe(false)
+    expect(
+      shouldLeaveFollowOnScrollUp(100, 100 - leaveFollowHysteresisPx)
+    ).toBe(true)
+    expect(shouldLeaveFollowOnScrollUp(50, 0)).toBe(true)
+  })
+})
 
 describe("OverviewLogPane", () => {
   it("renders all log lines associated with a specific resource", () => {
@@ -1715,6 +1743,131 @@ describe("OverviewLogPane", () => {
       component.componentWillUnmount()
 
       expect(removeListenerSpy).toHaveBeenCalledWith("wheel", component.onWheel)
+    })
+
+    it("does not leave follow mode on a sub-hysteresis upward flick", () => {
+      renderAllScheduledFrames()
+      expect(component.autoscroll).toBe(true)
+      const root = component.rootRef.current as HTMLElement
+      component.scrollTop = 100
+      root.scrollTop = 100 - (leaveFollowHysteresisPx - 1)
+      component.onScroll()
+      expect(component.autoscroll).toBe(true)
+    })
+
+    it("pages forward and rejoins live tail after a history excursion", () => {
+      renderAllScheduledFrames()
+      appendIncrementalLines(4 * renderWindow)
+      renderAllScheduledFrames()
+
+      for (let i = 0; i < 3; i++) {
+        component.scrollTop = 1
+        component.rootRef.current.scrollTop = 0
+        component.onScroll()
+        renderAllScheduledFrames()
+      }
+      expect(component.autoscroll).toBe(false)
+      // History walks leave newer lines off-DOM in the forward buffer.
+      expect(component.forwardBuffer.length).toBeGreaterThan(0)
+
+      // Live lines that arrive while reading history stay buffered until rejoin.
+      appendIncrementalLines(30)
+      expect(component.forwardBuffer.length).toBeGreaterThan(30)
+
+      const root = component.rootRef.current as HTMLElement
+      Object.defineProperty(root, "clientHeight", {
+        configurable: true,
+        value: 400,
+      })
+      Object.defineProperty(root, "scrollHeight", {
+        configurable: true,
+        value: 2000,
+      })
+      // Near the bottom edge of the current rendered window.
+      component.scrollTop = 1000
+      root.scrollTop = 2000 - 400 - 10
+      component.onScroll()
+      if (component.autoscrollRafId) {
+        fakeRaf.invoke(component.autoscrollRafId as number)
+      }
+      renderAllScheduledFrames()
+
+      expect(component.autoscroll).toBe(true)
+      let logElements = getLogElements(container)
+      expect(logElements.length).toBeLessThanOrEqual(renderedLineLimit)
+      // Second append reuses "incremental line N" labels from zero; the live
+      // store tail is the last of that batch (N = 29).
+      expect(logElements[logElements.length - 1]).toHaveTextContent(
+        "incremental line 29"
+      )
+      expect(
+        container.querySelector<HTMLElement>(".logEnd")?.style.visibility
+      ).toBe("")
+    })
+
+    it("engageLiveTail forces follow and restores the live cursor", () => {
+      renderAllScheduledFrames()
+      appendIncrementalLines(2 * renderWindow)
+      renderAllScheduledFrames()
+
+      // Leave follow via a deliberate upward scroll (hysteresis satisfied).
+      component.scrollTop = 100
+      component.rootRef.current.scrollTop = 50
+      component.onScroll()
+      expect(component.autoscroll).toBe(false)
+      const liveBefore = container.querySelector<HTMLButtonElement>(
+        '[aria-label="Jump to live logs"]'
+      )
+      expect(liveBefore?.hidden).toBe(false)
+
+      // Parent re-renders (HUD view stream) must not re-hide Live while still
+      // disengaged — visibility is imperative and restored on didUpdate.
+      component.forceUpdate()
+      expect(
+        container.querySelector<HTMLButtonElement>(
+          '[aria-label="Jump to live logs"]'
+        )?.hidden
+      ).toBe(false)
+
+      // Buffered live growth while disengaged (does not auto-render).
+      appendIncrementalLines(40)
+      expect(component.forwardBuffer.length).toBeGreaterThan(0)
+
+      component.engageLiveTail()
+      renderAllScheduledFrames()
+
+      expect(component.autoscroll).toBe(true)
+      let logElements = getLogElements(container)
+      expect(logElements.length).toBeLessThanOrEqual(renderedLineLimit)
+      // Labels restart at 0 per appendIncrementalLines batch; live tail is 39.
+      expect(logElements[logElements.length - 1]).toHaveTextContent(
+        "incremental line 39"
+      )
+      const live = container.querySelector<HTMLButtonElement>(
+        '[aria-label="Jump to live logs"]'
+      )
+      expect(live).not.toBeNull()
+      expect(live?.hidden).toBe(true)
+    })
+
+    it("keeps peak rendered lines within the 750 cap after return-to-tail", () => {
+      renderAllScheduledFrames()
+      appendIncrementalLines(6 * renderWindow)
+      renderAllScheduledFrames()
+      for (let i = 0; i < 5; i++) {
+        component.scrollTop = 1
+        component.rootRef.current.scrollTop = 0
+        component.onScroll()
+        renderAllScheduledFrames()
+        expect(getLogElements(container).length).toBeLessThanOrEqual(
+          renderedLineLimit
+        )
+      }
+      component.engageLiveTail()
+      renderAllScheduledFrames()
+      expect(getLogElements(container).length).toBeLessThanOrEqual(
+        renderedLineLimit
+      )
     })
 
     it("moves the bounded window into history and back to the tail", () => {

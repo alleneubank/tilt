@@ -37,6 +37,13 @@ type OverviewLogComponentProps = {
   starredResources: string[]
 }
 
+let LogPaneShell = styled.div`
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+`
+
 let LogPaneRoot = styled.section`
   padding: 0 0 ${SizeUnit(0.25)} 0;
   background-color: ${Color.gray10};
@@ -45,6 +52,32 @@ let LogPaneRoot = styled.section`
   overflow-y: auto;
   box-sizing: border-box;
   font-size: ${FontSize.smallest};
+`
+
+// Floating rejoin control (REQ-LOGPANE-007). Visibility is toggled imperatively
+// with follow mode; React does not re-render on autoscroll mutations.
+let LiveControl = styled.button`
+  position: absolute;
+  right: ${SizeUnit(0.5)};
+  bottom: ${SizeUnit(0.5)};
+  z-index: 2;
+  border: 1px solid ${Color.gray40};
+  border-radius: 4px;
+  background: ${Color.gray20};
+  color: ${Color.gray70};
+  font-size: ${FontSize.small};
+  padding: ${SizeUnit(0.15)} ${SizeUnit(0.4)};
+  cursor: pointer;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+
+  &:hover {
+    color: ${Color.blue};
+    border-color: ${Color.blue};
+  }
+
+  &[hidden] {
+    display: none;
+  }
 `
 
 const blink = keyframes`
@@ -394,6 +427,49 @@ export const viewportFillEpsilon = 4
 // is a safety ceiling, not an expected count.
 export const maxViewportFillPasses = 8
 
+// REQ-LOGPANE-007: treat the user as at the bottom when within this many px of
+// max scroll so rejoin/forward paging does not require a perfect cursor rect.
+export const returnToTailProximityPx = 48
+
+// REQ-LOGPANE-007: ignore tiny upward scroll deltas so a one-line flick does
+// not leave follow mode (top-boundary scrollTop === 0 still loads history).
+export const leaveFollowHysteresisPx = 8
+
+/** Pure geometry: true when scroll position is within proximity of the bottom. */
+export function isNearScrollBottom(
+  scrollTop: number,
+  scrollHeight: number,
+  clientHeight: number,
+  proximityPx: number = returnToTailProximityPx
+): boolean {
+  // Unmeasurable layout (jsdom or detached) must not claim "at bottom" —
+  // that would rejoin follow and drain the forward buffer during history
+  // walks that never produce real geometry.
+  if (clientHeight <= 0) {
+    return false
+  }
+  let maxScroll = Math.max(0, scrollHeight - clientHeight)
+  // Non-overflowing content is underfill (geometry fill), not a deliberate
+  // bottom-edge hold for return-to-tail. Requiring real scroll range keeps
+  // underfill from force-rejoining follow while a forward buffer exists.
+  if (maxScroll === 0) {
+    return false
+  }
+  return maxScroll - scrollTop <= proximityPx
+}
+
+/** Pure: whether an upward scroll delta is large enough to leave follow mode. */
+export function shouldLeaveFollowOnScrollUp(
+  oldScrollTop: number,
+  scrollTop: number,
+  hysteresisPx: number = leaveFollowHysteresisPx
+): boolean {
+  if (scrollTop === 0) {
+    return true
+  }
+  return oldScrollTop - scrollTop >= hysteresisPx
+}
+
 type RenderDirection = "forward" | "backward"
 
 // The same top geometry has two different meanings: reader movement leaves
@@ -426,6 +502,9 @@ export class OverviewLogComponent extends Component<OverviewLogComponentProps> {
 
   // The blinking cursor at the end of the component.
   private cursorRef: React.RefObject<HTMLParagraphElement> = React.createRef()
+
+  // Explicit return-to-tail control (REQ-LOGPANE-007).
+  private liveControlRef: React.RefObject<HTMLButtonElement> = React.createRef()
 
   // Track the scrollTop of the root element to see if the user is scrolling upwards.
   scrollTop: number = -1
@@ -575,6 +654,10 @@ export class OverviewLogComponent extends Component<OverviewLogComponentProps> {
       this.resetRender()
       this.readLogsFromLogStore()
     }
+
+    // Parent HUD re-renders re-mount prop identity without changing follow
+    // mode; re-assert Live visibility so a static JSX default cannot hide it.
+    this.updateLiveControlVisibility()
   }
 
   componentDidMount() {
@@ -594,9 +677,15 @@ export class OverviewLogComponent extends Component<OverviewLogComponentProps> {
     rootEl.addEventListener("wheel", this.onWheel, {
       passive: true,
     })
+    rootEl.addEventListener("keydown", this.onKeyDown)
+    // Focusable so End can rejoin without focusing a child control.
+    if (!rootEl.hasAttribute("tabindex")) {
+      rootEl.tabIndex = 0
+    }
     this.observeViewportFillTriggers(rootEl)
     this.resetRender()
     this.readLogsFromLogStore()
+    this.updateLiveControlVisibility()
 
     this.props.logStore.addUpdateListener(this.onLogUpdate)
   }
@@ -767,6 +856,7 @@ export class OverviewLogComponent extends Component<OverviewLogComponentProps> {
     }
     rootEl.removeEventListener("scroll", this.onScroll)
     rootEl.removeEventListener("wheel", this.onWheel)
+    rootEl.removeEventListener("keydown", this.onKeyDown)
 
     this.viewportResizeObserver?.disconnect()
     this.viewportResizeObserver = null
@@ -823,22 +913,27 @@ export class OverviewLogComponent extends Component<OverviewLogComponentProps> {
     }
 
     // Upward movement disengages follow mode and, at the current DOM boundary,
-    // requests exactly one older window.
+    // requests exactly one older window. Sub-threshold deltas stay in follow
+    // (REQ-LOGPANE-007 hysteresis) so a one-line flick is not a trap.
     if (scrollTop < oldScrollTop) {
-      // History is loaded one window at a time only when the user reaches the
-      // current DOM boundary. The visible anchor is restored after prepending.
       if (scrollTop === 0) {
         this.hydrateAndScheduleHistoryAtTopBoundary("reader-movement")
-      } else {
+      } else if (
+        shouldLeaveFollowOnScrollUp(
+          oldScrollTop,
+          scrollTop,
+          leaveFollowHysteresisPx
+        )
+      ) {
         this.disengageFollowMode()
       }
       return
     }
 
-    // If we're not autoscrolling, and the user scrolled down,
-    // we may have to re-engage the autoscroll.
+    // Downward motion: page newer off-DOM lines when the rendered window's
+    // bottom is in view, then re-engage follow (REQ-LOGPANE-007).
     if (!autoscroll && scrollTop > oldScrollTop) {
-      this.maybeEngageAutoscroll()
+      this.handleReturnTowardTail()
     }
   }
 
@@ -866,6 +961,9 @@ export class OverviewLogComponent extends Component<OverviewLogComponentProps> {
     }
 
     this.autoscroll = false
+    this.updateLiveControlVisibility()
+    // Expand runway only at the top-boundary hydrate path — mid-window leave
+    // must freeze the visible identities (REQ-LOGPANE freeze / 007).
     return true
   }
 
@@ -884,10 +982,92 @@ export class OverviewLogComponent extends Component<OverviewLogComponentProps> {
     // Reader movement is authoritative once its visible anchor is valid, even
     // when the compact tail contains the store's full history.
     this.autoscroll = false
+    this.updateLiveControlVisibility()
 
     if (hasOlderHistory) {
       this.maybeScheduleRender("backward")
     }
+    if (intent === "reader-movement") {
+      this.expandHistoryRunwayAfterDisengage()
+    }
+  }
+
+  // After leaving a compact follow tail, mount more surrounding history so the
+  // pane has scroll runway for return-to-tail (REQ-LOGPANE-007 should-have).
+  private expandHistoryRunwayAfterDisengage() {
+    if (this.autoscroll || this.backwardBuffer.length === 0) {
+      return
+    }
+    if (this.renderedLineCount() > this.currentTailLimit() + 5) {
+      return
+    }
+    if (this.renderedLineCount() >= renderedLineLimit) {
+      return
+    }
+    this.maybeScheduleRender("backward")
+  }
+
+  private isNearBottom(proximityPx: number = returnToTailProximityPx): boolean {
+    let rootEl = this.rootRef.current
+    if (!rootEl) {
+      return true
+    }
+    return isNearScrollBottom(
+      rootEl.scrollTop,
+      rootEl.scrollHeight,
+      rootEl.clientHeight,
+      proximityPx
+    )
+  }
+
+  private updateLiveControlVisibility() {
+    let el = this.liveControlRef.current
+    if (el) {
+      el.hidden = this.autoscroll
+    }
+  }
+
+  // Explicit rejoin: force follow and drain/coalesce to the live tail.
+  engageLiveTail = () => {
+    if (this.props.pathBuilder.isSnapshot()) {
+      return
+    }
+    this.needsScrollToLine = false
+    this.autoscroll = true
+    this.updateLiveControlVisibility()
+    if (this.forwardBuffer.length > 0) {
+      this.maybeScheduleRender("forward")
+    } else {
+      if (this.historyHydrated) {
+        this.compactHistoryAtTail()
+      }
+      this.scrollCursorIntoView()
+    }
+  }
+
+  private onKeyDown = (e: KeyboardEvent) => {
+    if (e.key !== "End" || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) {
+      return
+    }
+    if (this.autoscroll) {
+      return
+    }
+    e.preventDefault()
+    this.engageLiveTail()
+  }
+
+  private handleReturnTowardTail() {
+    // Page newer lines while the user is at the bottom of the rendered window
+    // so return is continuous; a large forward gap re-engages follow so
+    // coalesce jumps to the live tail (same path as e2e scrollHeight jump).
+    if (this.isNearBottom() && this.forwardBuffer.length > 0) {
+      if (this.forwardBuffer.length > renderWindow) {
+        this.autoscroll = true
+        this.updateLiveControlVisibility()
+      }
+      this.maybeScheduleRender("forward")
+    }
+    this.maybeEngageAutoscroll()
   }
 
   private maybeEngageAutoscroll() {
@@ -910,6 +1090,7 @@ export class OverviewLogComponent extends Component<OverviewLogComponentProps> {
       let autoscroll = this.computeAutoScroll()
       if (autoscroll) {
         this.autoscroll = true
+        this.updateLiveControlVisibility()
         this.maybeScheduleRender("forward")
       }
     })
@@ -932,6 +1113,19 @@ export class OverviewLogComponent extends Component<OverviewLogComponentProps> {
     // Never auto-scroll if we're horizontally scrolled.
     if (rootEl.scrollLeft) {
       return false
+    }
+
+    // Proximity rejoin (REQ-LOGPANE-007): near the bottom of the scrollable
+    // pane is enough — do not require the cursor rect to be fully in view.
+    if (
+      isNearScrollBottom(
+        rootEl.scrollTop,
+        rootEl.scrollHeight,
+        rootEl.clientHeight,
+        returnToTailProximityPx
+      )
+    ) {
+      return true
     }
 
     let lastElInView =
@@ -1589,6 +1783,17 @@ export class OverviewLogComponent extends Component<OverviewLogComponentProps> {
     this.renderDirection = null
     if (this.autoscroll && this.forwardBuffer.length > 0) {
       this.maybeScheduleRender("forward")
+    } else if (
+      !this.autoscroll &&
+      this.isNearBottom() &&
+      this.forwardBuffer.length > 0
+    ) {
+      // Keep paging toward live while the reader holds the bottom edge.
+      if (this.forwardBuffer.length > renderWindow) {
+        this.autoscroll = true
+        this.updateLiveControlVisibility()
+      }
+      this.maybeScheduleRender("forward")
     } else if (this.needsScrollToLine && this.backwardBuffer.length > 0) {
       this.maybeScheduleRender("backward")
     } else if (
@@ -1616,6 +1821,8 @@ export class OverviewLogComponent extends Component<OverviewLogComponentProps> {
         this.maybeScheduleRender(continuation)
       }
     }
+
+    this.updateLiveControlVisibility()
 
     // A refill deferred because a render was in flight re-runs now that this
     // render has completed and the geometry it produced is final.
@@ -1738,11 +1945,21 @@ export class OverviewLogComponent extends Component<OverviewLogComponentProps> {
 
   render() {
     return (
-      <LogPaneRoot ref={this.rootRef} aria-label="Log pane">
-        <LogEnd key="logEnd" className="logEnd" ref={this.cursorRef}>
-          &#9608;
-        </LogEnd>
-      </LogPaneRoot>
+      <LogPaneShell>
+        <LiveControl
+          ref={this.liveControlRef}
+          type="button"
+          aria-label="Jump to live logs"
+          onClick={this.engageLiveTail}
+        >
+          ↓ Live
+        </LiveControl>
+        <LogPaneRoot ref={this.rootRef} aria-label="Log pane">
+          <LogEnd key="logEnd" className="logEnd" ref={this.cursorRef}>
+            &#9608;
+          </LogEnd>
+        </LogPaneRoot>
+      </LogPaneShell>
     )
   }
 }
