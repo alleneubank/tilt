@@ -130,6 +130,21 @@ websocket view-stream
   → floors: `OverviewLogPane` unit tests for forward page, Live/rejoin,
   hysteresis, underfill-vs-near-bottom, and ≤750; `e2e:log-pane` return-to-tail
   journey green.
+- **REQ-LOGPANE-008 — Quiet pane does not flash under foreign firehose.**
+  While follow mode is settled on resource A and A's store-side log content
+  is stable (no new or revised lines for A's spans), log-store appends that
+  only touch other manifests (or yield an empty filtered patch for A) must
+  not thrash the pane:
+  1. **FLASH-1** — zero `scrollCursorIntoView` calls after settle.
+  2. **FLASH-2** — zero no-op `renderBuffer` schedules (no rAF whose work
+     mounts or unmounts nothing merely to re-assert scroll).
+  3. **FLASH-3** — every mounted `.LogLine` keeps its outer element
+     identity for an unchanged `data-sl-index`.
+  The intentional CSS opacity blink on `.logEnd` is excluded and is never
+  a failure. Truncate-driven full resets (FLASH-5) are reported when
+  measured; they are not a quiet-firehose fail in v1.
+  → floors: `OverviewLogPane` unit tests for other-manifest firehose after
+  settle; optional hermetic quiet-window probe in tilt-web-perf (FLASH-1/3/4).
 
 ### Perf gates (all on release-equivalent builds, via tilt-web-perf `run-map.sh`)
 
@@ -255,6 +270,11 @@ accepted, store-side regex filter covers the find workflow (Decisions #4).
    virtual-list rewrite; never raise the 750-line cap. Expand runway only at
    top-boundary hydrate; underfill is not near-bottom; Live survives parent
    re-renders.
+8. **Quiet-pane flash** (REQ-LOGPANE-008, 2026-07-23): flash is operational
+   (no-op scrollIntoView, no-op render schedule, LogLine outer-identity
+   churn), not the intentional `.logEnd` cursor blink. Causal unit floors
+   gate first; hermetic e2e quiet-window sensors are the independent oracle
+   when available. Live localnet informs only.
 
 The same batch is appended to tilt-web-perf `BRIEF.md` Decisions.
 
@@ -286,7 +306,7 @@ The REQ-FIX-004 check produced the accepted red. Facts (release build
 
 | Requirement | Primary proof |
 | --- | --- |
-| REQ-LOGPANE-001..007, 003a | `LogStore.test.ts`, `OverviewLogPane.test.tsx`, quiet Probe A/A2/B, `e2e:log-pane` |
+| REQ-LOGPANE-001..008, 003a | `LogStore.test.ts`, `OverviewLogPane.test.tsx`, quiet Probe A/A2/B, `e2e:log-pane` |
 | REQ-HUDPERF-001..002 | range/window tests; `e2e:hud-scale` global mounted bounds |
 | REQ-HUDPERF-003 | `e2e:hud-scale` far-tail exact-filter/direct-route reachability; model, scroll, keyboard, a11y tests |
 | REQ-HUDPERF-004..006 | model, scroll, keyboard, a11y component tests (including missing-`ResizeObserver` fallback) |
