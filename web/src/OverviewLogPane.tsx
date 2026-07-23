@@ -1217,6 +1217,14 @@ export class OverviewLogComponent extends Component<OverviewLogComponentProps> {
   }
 
   private replaceCompactTail(incomingLines: LogLine[]) {
+    // REQ-LOGPANE-008: a settled compact follow tail has nothing to do when
+    // the store advanced only for other manifests (empty filtered patch).
+    // Rebuilding the index and scheduling a no-op render would still call
+    // scrollCursorIntoView and flash sticky build-event headers.
+    if (incomingLines.length === 0 && !this.historyHydrated) {
+      return
+    }
+
     let compactLines = this.compactTailLines(
       this.lineHashList.lines().concat(incomingLines)
     )
@@ -1295,7 +1303,11 @@ export class OverviewLogComponent extends Component<OverviewLogComponentProps> {
     this.historyHydrated = false
     this.updateCursorVisibility()
 
-    if (tailLines.length) {
+    // Only schedule when something still needs mounting or content refresh.
+    // A rebuild that retained every identity with the same line object leaves
+    // forwardBuffer empty; scheduling that frame would be a no-op thrash
+    // (REQ-LOGPANE-008 FLASH-2 defense-in-depth).
+    if (this.forwardBuffer.length > 0) {
       this.maybeScheduleRender("forward")
     }
   }
@@ -1431,8 +1443,9 @@ export class OverviewLogComponent extends Component<OverviewLogComponentProps> {
       this.updateCursorVisibility()
 
       // Keep receiving updates while the user reads history, but do not move
-      // their window until they explicitly return to the bottom.
-      if (this.autoscroll) {
+      // their window until they explicitly return to the bottom. Empty patches
+      // (foreign-manifest firehose) must not schedule a no-op render.
+      if (this.autoscroll && lines.length > 0) {
         this.maybeScheduleRender("forward")
       }
     } else {
@@ -1720,6 +1733,10 @@ export class OverviewLogComponent extends Component<OverviewLogComponentProps> {
     }
 
     let anchor = direction === "backward" ? this.captureVisibleAnchor() : null
+    // REQ-LOGPANE-008: only force the cursor into view when this frame actually
+    // mounted or refreshed lines. A scheduled no-op (or foreign-manifest
+    // notification that left the buffers empty) must not reflow sticky headers.
+    let renderedWork = false
 
     if (direction === "forward" && this.shouldRenderForwardBuffer()) {
       let forwardCount =
@@ -1727,6 +1744,9 @@ export class OverviewLogComponent extends Component<OverviewLogComponentProps> {
       let forwardLines = this.forwardBuffer.slice(0, forwardCount)
       this.forwardBuffer = this.forwardBuffer.slice(forwardCount)
       this.makeRoomFor(forwardLines, "forward")
+      if (forwardLines.length > 0) {
+        renderedWork = true
+      }
       for (let line of forwardLines) {
         this.renderLineHelper(line)
       }
@@ -1744,6 +1764,9 @@ export class OverviewLogComponent extends Component<OverviewLogComponentProps> {
       let backwardLines = this.backwardBuffer.slice(backwardStart)
       this.backwardBuffer = this.backwardBuffer.slice(0, backwardStart)
       this.makeRoomFor(backwardLines, "backward")
+      if (backwardLines.length > 0) {
+        renderedWork = true
+      }
 
       for (let i = backwardLines.length - 1; i >= 0; i--) {
         let line = backwardLines[i]
@@ -1765,7 +1788,7 @@ export class OverviewLogComponent extends Component<OverviewLogComponentProps> {
       this.compactHistoryAtTail()
     }
 
-    if (this.autoscroll) {
+    if (this.autoscroll && renderedWork) {
       this.scrollCursorIntoView()
     }
 

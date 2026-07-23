@@ -1988,5 +1988,101 @@ describe("OverviewLogPane", () => {
         }
       }
     })
+
+    // REQ-LOGPANE-008 — quiet selected resource under foreign firehose.
+    // FLASH-1/2/3: other-manifest appends must not thrash a settled follow tail.
+    describe("quiet pane under foreign firehose (REQ-LOGPANE-008)", () => {
+      function outerIdentityMap(testContainer: HTMLElement) {
+        let map = new Map<number, Element>()
+        Array.from(getLogElements(testContainer)).forEach((el) => {
+          let storedLineIndex = Number(el.getAttribute("data-sl-index"))
+          map.set(storedLineIndex, el)
+        })
+        return map
+      }
+
+      function firehoseOtherManifest(rounds: number = 3) {
+        for (let i = 0; i < rounds; i++) {
+          appendLines(
+            component.props.logStore,
+            "be",
+            `foreign firehose line ${i}\n`
+          )
+          component.onLogUpdate({ action: LogUpdateAction.append })
+          jest.advanceTimersByTime(liveLogReadIntervalMs)
+          renderAllScheduledFrames()
+        }
+      }
+
+      it("FLASH-1: does not scrollCursorIntoView on other-manifest appends", () => {
+        renderAllScheduledFrames()
+        expect(component.autoscroll).toBe(true)
+        expect(getLogElements(container).length).toBeGreaterThan(0)
+
+        let scrollSpy = jest.spyOn(component, "scrollCursorIntoView")
+        firehoseOtherManifest(3)
+
+        expect(scrollSpy).not.toHaveBeenCalled()
+      })
+
+      it("FLASH-2: does not schedule no-op renderBuffer work for empty patches", () => {
+        renderAllScheduledFrames()
+        expect(component.renderBufferRafId).toBe(0)
+
+        let scheduleSpy = jest.spyOn(component, "maybeScheduleRender")
+        firehoseOtherManifest(3)
+
+        expect(scheduleSpy).not.toHaveBeenCalled()
+        expect(component.renderBufferRafId).toBe(0)
+      })
+
+      it("FLASH-3: keeps LogLine outer element identity for unchanged indices", () => {
+        renderAllScheduledFrames()
+        let before = outerIdentityMap(container)
+        expect(before.size).toBeGreaterThan(0)
+
+        firehoseOtherManifest(3)
+
+        let after = outerIdentityMap(container)
+        expect(after.size).toBe(before.size)
+        for (let [storedLineIndex, el] of Array.from(before.entries())) {
+          expect(after.get(storedLineIndex)).toBe(el)
+        }
+      })
+
+      it("still follows when the selected resource itself appends", () => {
+        renderAllScheduledFrames()
+        let scrollSpy = jest.spyOn(component, "scrollCursorIntoView")
+        appendLines(component.props.logStore, "fe", "own resource tail\n")
+        component.onLogUpdate({ action: LogUpdateAction.append })
+        jest.advanceTimersByTime(liveLogReadIntervalMs)
+        renderAllScheduledFrames()
+
+        expect(scrollSpy).toHaveBeenCalled()
+        expect(
+          getLogElements(container)[getLogElements(container).length - 1]
+        ).toHaveTextContent("own resource tail")
+      })
+
+      it("does not thrash after history is hydrated and foreign logs arrive", () => {
+        renderAllScheduledFrames()
+        // Top-boundary scroll hydrates full history (historyHydrated = true).
+        component.scrollTop = 1000
+        component.rootRef.current.scrollTop = 0
+        component.onScroll()
+        renderAllScheduledFrames()
+        expect((component as any).historyHydrated).toBe(true)
+
+        // Rejoin follow so autoscroll is true while still history-owned until
+        // the next compact-at-tail; foreign appends must not schedule.
+        component.autoscroll = true
+        let scheduleSpy = jest.spyOn(component, "maybeScheduleRender")
+        let scrollSpy = jest.spyOn(component, "scrollCursorIntoView")
+        firehoseOtherManifest(2)
+
+        expect(scheduleSpy).not.toHaveBeenCalled()
+        expect(scrollSpy).not.toHaveBeenCalled()
+      })
+    })
   })
 })

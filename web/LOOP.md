@@ -14,8 +14,9 @@ reflow thrash while long-task duration looked green.
 
 - **Terminal: interior-green.** Product fix landed; floors red→green cited;
   adversarial review **APPROVE**; publish/release remain human-only.
-- Branch `master`, working tree holds flash campaign (SPEC, LOOP, pane,
-  tests). Nothing pushed.
+- Branch `master`: `fix(web): stop log pane thrash under foreign firehose`
+  atop `880747999` docs. Ahead of origin by 2; nothing pushed (publish is
+  human).
 - **Pre-fix red (Layer A):** FLASH-1 scrollSpy 3 calls; FLASH-2 schedule
   3× `"forward"` on other-manifest firehose. Captured
   `flash-layer-a-red.log`. FLASH-3 already green pre-fix (identity retained).
