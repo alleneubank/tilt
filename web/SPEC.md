@@ -144,7 +144,9 @@ websocket view-stream
   a failure. Truncate-driven full resets (FLASH-5) are reported when
   measured; they are not a quiet-firehose fail in v1.
   → floors: `OverviewLogPane` unit tests for other-manifest firehose after
-  settle; optional hermetic quiet-window probe in tilt-web-perf (FLASH-1/3/4).
+  settle; hermetic quiet-window probe `e2e:log-pane-flash` in tilt-web-perf
+  (FLASH-1/3/4 == 0, `measured: true`, steady fixture, quiet resource
+  `stable-000` under foreign firehose).
 
 ### Perf gates (all on release-equivalent builds, via tilt-web-perf `run-map.sh`)
 

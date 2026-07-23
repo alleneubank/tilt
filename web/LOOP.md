@@ -28,10 +28,13 @@ reflow thrash while long-task duration looked green.
   (`overview-log-pane-tests-final.log`); quiet-firehose 5/5 including
   history-hydrated foreign case; `yarn check` exit 0 (`web-check.log`).
 - **E2E:** `log-pane-e2e` with `--assets-dir web/build` + k3d-burst:
-  `PASS ... max 750 rendered lines` (`log-pane-e2e.log`). Layer B quiet
-  firehose hermetic sensors not added as a separate cell; unit FLASH-1/2/3
-  + e2e return-to-tail/cap are the gating bar for this campaign.
-- **Review:** adversarial subagent APPROVE (`flash-review.md`);
+  `PASS ... max 750 rendered lines` (`log-pane-e2e.log`).
+- **Layer B:** `e2e:log-pane-flash` on steady + `stable-000` + fixed
+  production assets: FLASH-1/3/4 all 0, measured true, firehose tail
+  32955→34496 (`flash-layer-b.json` / `flash-layer-b-e2e.log`). Logic
+  unit tests 5/5. Review REJECT (missing firehose advance) → fixed →
+  APPROVE (`flash-layer-b-review-final.md`).
+- **Review (product):** adversarial APPROVE (`flash-review.md`);
   post-review suggestion fixups applied; final note
   `flash-review-final.md`. No open bug/major.
 - User report context retained: screenshot uncategorized / sticky Initial
@@ -64,10 +67,12 @@ reflow thrash while long-task duration looked green.
    in-place content (if any residual path remains), (d) truncate flash
    only if measured rate warrants product change (reporting first).
    provisional (driver).
-5. 2026-07-23 — **Interior-green without separate Layer B cell.** Unit
-   FLASH-1/2/3 + existing hermetic `e2e:log-pane` (return-to-tail, ≤750)
-   gate this campaign; a dedicated quiet-window FLASH-1/3/4 sensor in
-   tilt-web-perf remains optional follow-up, not a ship blocker.
+5. 2026-07-23 — **Layer B hermetic quiet-window is a gate.** Unit FLASH-1/2/3
+   remain the pre-fix red oracle for the compact thrash path; hermetic
+   `e2e:log-pane-flash` (steady fixture, `stable-000`, ≥10 s observe,
+   FLASH-1/3/4 == 0 + measured:true) is the independent browser oracle.
+   Pre-M5 fixture assets can also read zero because they early-return before
+   scroll on empty patches — they do not disprove the compact-path bug.
    provisional (driver).
 
 ## Flash measurement (the campaign's first product)
@@ -116,31 +121,24 @@ in-place holds; existing REQ-LOGPANE unit suite stays green.
 
 ### Layer B — hermetic e2e (independent oracle)
 
-Location: tilt-web-perf (new probe or extension of `log-pane-e2e` /
-busy-resource cell). Release-equivalent build only for gate claims.
+Location: tilt-web-perf `bun run e2e:log-pane-flash` →
+`src/log-pane-flash-e2e.ts` (+ pure floors in
+`log-pane-flash-e2e-logic.ts`). Release-equivalent / production assets
+via `--assets-dir` for gate claims.
 
-**Probe shape:**
+**Probe shape (implemented):**
 
-1. Replay steady fixture; open a resource whose manifest receives **no**
-   further segments after T0 (or filter to one whose log is static in the
-   fixture slice).
-2. After settle, install page-side sensors for observe window ≥ 10 s
-   while the firehose continues:
-   - wrap the log-end node's `scrollIntoView` (FLASH-1)
-   - `MutationObserver` childList on the log pane root, counting
-     `.LogLine` add/remove (FLASH-3)
-   - `scroll` listener on the pane with a flag that ignores events
-     immediately after scripted user gestures (FLASH-4)
-3. Floors (v1 absolutes, fail-closed if sensors missing):
-   - FLASH-1 count == 0
-   - FLASH-3 remount count == 0
-   - FLASH-4 unprompted scroll count == 0
-   - sensors must report `measured: true` (unavailable sensors = fail,
-     never a free pass)
+1. Authorized **steady** fixture; open `/r/stable-000/overview` (zero
+   post-settle log bytes for that manifest in k3d-steady; firehose is
+   `log-storm` + chatty-*).
+2. Wait for pane lines; install sensors; settle 2.5 s; arm; observe ≥ 10 s.
+3. Floors (fail-closed if sensors missing):
+   - FLASH-1 `scrollIntoViewCalls == 0`
+   - FLASH-3 `logLineChildListMutations == 0`
+   - FLASH-4 `unpromptedScrollEvents == 0`
+   - `measured: true`, `installed: true`
 
-**Inform-only in v1:** long-task ms and layout-shift attribution during
-the quiet window — report in the run artifact, do not gate until noise
-is characterized.
+**Inform-only in v1:** long-task ms / layout-shift during the quiet window.
 
 ### Layer C — how a human confirms the measurement (attended, once)
 
@@ -172,10 +170,12 @@ correlates FLASH-1; it does not gate.
    with cited test.
 5. **Layer B probe** — quiet-resource-under-firehose in tilt-web-perf;
    run release-equivalent once; cite green/red.
-6. **Regression guard** — existing `yarn test` OverviewLogPane suite +
+6. **Layer B** — land and green `e2e:log-pane-flash` on production assets
+   + steady fixture; record JSON snapshot.
+7. **Regression guard** — existing `yarn test` OverviewLogPane suite +
    `e2e:log-pane` return-to-tail + map floors remain green (no M5
    backslide).
-7. **Dissolve** — on ship, migrate floors into SPEC/BRIEF permanently;
+8. **Dissolve** — on ship, migrate floors into SPEC/BRIEF permanently;
    delete this LOOP.md per doctrine.
 
 ## Verification floors
@@ -185,8 +185,9 @@ correlates FLASH-1; it does not gate.
 - **Log pane correctness:** `cd web && yarn test --watchAll=false --testPathPattern=OverviewLogPane` green;
   existing return-to-tail / ≤750 coverage untouched.
 - **Static:** `cd web && yarn check` green on touched files.
-- **Flash e2e (Layer B):** when present, quiet-window FLASH-1/3/4 == 0
-  with `measured: true` on release build + hermetic fixture.
+- **Flash e2e (Layer B):** `bun run e2e:log-pane-flash -- --assets-dir
+  <prod> --fixture fixtures/k3d-steady` → FLASH-1/3/4 == 0,
+  `measured: true`.
 - **No M5 backslide:** if a release-map cell is re-run, existing
   REQ-PERF-001 absolutes still hold (inform if time-boxed; required
   before a fork release that claims flash-fixed).
