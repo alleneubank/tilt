@@ -46,6 +46,21 @@ import {
 } from "./testdata"
 import { RuntimeStatus, TriggerMode, UpdateStatus } from "./types"
 
+// Returns the emitted styled-components CSS whose selector targets one of the
+// element's classes. jsdom's parser drops properties it does not model (e.g.
+// overflow-anchor) from the CSSOM and getComputedStyle, so read the raw <style>
+// text styled-components injects in the test environment.
+function styledRuleFor(element: Element | null): string {
+  if (!element) return ""
+  const classes = Array.from(element.classList)
+  return Array.from(document.querySelectorAll("style"))
+    .map((sheet) => sheet.textContent || "")
+    .join("\n")
+    .split("}")
+    .filter((rule) => classes.some((cls) => rule.includes(`.${cls}`)))
+    .join("}")
+}
+
 // Helpers
 const tableViewWithSettings = ({
   view,
@@ -153,6 +168,12 @@ it("uses one bounded overview resource window across label groups", () => {
   const resources = container.querySelectorAll('tbody tr[tabindex="-1"]')
 
   expect(owner).toHaveStyle({ overflowY: "auto" })
+  // The virtualized scrollport must disable native scroll anchoring, or the
+  // browser rewrites scrollTop as the synthetic spacers resize and traps the
+  // wheel (scroll-anchor trap, worst at DPR 2). jsdom cannot compute
+  // overflow-anchor, so assert the rule reached the emitted stylesheet; the
+  // DPR-2 browser probe verifies the behavior.
+  expect(styledRuleFor(owner)).toContain("overflow-anchor:none")
   expect(resources.length).toBeLessThanOrEqual(3)
 
   Object.defineProperty(HTMLElement.prototype, "clientHeight", {

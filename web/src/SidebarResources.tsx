@@ -56,6 +56,10 @@ export let SidebarResourcesRoot = styled.nav`
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
+  // Same virtualized-scrollport rule as OverviewTableRoot: the window's
+  // synthetic spacers resize during scroll, so native scroll anchoring must be
+  // disabled or it rewrites scrollTop and traps the wheel.
+  overflow-anchor: none;
   &.isOverview {
     flex-shrink: 1;
   }

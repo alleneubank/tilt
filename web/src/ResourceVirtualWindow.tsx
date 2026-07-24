@@ -17,6 +17,19 @@ import {
 
 type ContentOriginVersion = string | number | boolean
 
+const anchorSettleEpsilonPx = 1
+
+// A navigation target has reached its resting position once its anchor
+// adjustment is within a sub-pixel of settled. An exact `=== 0` test never holds
+// under DPR-2 sub-pixel geometry in a busy list (constant firehose re-renders):
+// the adjustment asymptotes to a fraction and never reaches exactly 0, so an
+// `=== 0` completion gate strands the request in "positioning" — and the window
+// then force-scrolls the selected resource into view every frame, trapping the
+// reader's scroll.
+export function targetAnchorSettled(anchorAdjustment: number): boolean {
+  return Math.abs(anchorAdjustment) <= anchorSettleEpsilonPx
+}
+
 export type ResourceVirtualWindowProps<T> = Readonly<{
   entries: ReadonlyArray<ResourceVirtualEntry<T>>
   /** The caller owns list/table semantics, so the window never adds row wrappers. */
@@ -284,14 +297,31 @@ export function ResourceVirtualWindow<T>(props: ResourceVirtualWindowProps<T>) {
   ])
   useLayoutEffect(() => {
     if (
+      !geometry ||
       geometryIsStale ||
       props.targetKey ||
       range.anchorAdjustment !== 0 ||
       !range.visibleResource
     )
       return
+    // Only baseline the anchor from a geometry snapshot the DOM still agrees
+    // with. A scroll event nulls the anchor and queues a fresh geometry frame,
+    // but a data-driven re-render can land first carrying the pre-scroll
+    // scrollTop. Baselining the anchor here would make the next correction
+    // compute anchorAdjustment = -(scrolled delta) and revert the user's
+    // in-flight scroll — the retained-anchor scroll trap, worst at DPR 2 where
+    // the racing re-render reliably beats the frame.
+    const element = owner()
+    if (
+      element &&
+      Math.abs(
+        element.scrollTop - (geometry.contentOrigin + geometry.scrollTop)
+      ) > 1
+    )
+      return
     retainedAnchor.current = range.visibleResource
   }, [
+    geometry,
     geometryIsStale,
     props.targetKey,
     range.anchorAdjustment,
@@ -330,7 +360,8 @@ export function ResourceVirtualWindow<T>(props: ResourceVirtualWindowProps<T>) {
       return
     const element = owner()
     const target = mounted.current.get(props.targetKey)
-    if (!element || !target || range.anchorAdjustment !== 0) return
+    if (!element || !target || !targetAnchorSettled(range.anchorAdjustment))
+      return
     // Preserve the exact target viewport before the parent clears targetKey
     // from this layout callback. The clear render can then never see a stale
     // ordinary anchor or an intermediate geometry snapshot.

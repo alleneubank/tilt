@@ -107,6 +107,14 @@ const OverviewTableRoot = styled.section`
   min-height: 0;
   overflow-x: auto;
   overflow-y: auto;
+  // This scrollport virtualizes its rows with synthetic before/after spacers
+  // that resize as the window shifts. Native scroll anchoring reads those
+  // resizes as content shifts and rewrites scrollTop to compensate, fighting
+  // the wheel — a ~1-row snap-back per frame that traps normal-speed scrolling
+  // (worst at DPR 2, where sub-pixel spacer heights make it fire every frame).
+  // The window does its own retained-anchor stabilization; browser anchoring
+  // must stay out of it.
+  overflow-anchor: none;
   padding-bottom: ${SizeUnit(1 / 2)};
 `
 

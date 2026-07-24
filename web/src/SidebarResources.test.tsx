@@ -206,6 +206,24 @@ describe("SidebarResources", () => {
     localStorage.clear()
   })
 
+  it("disables native scroll anchoring on the virtualized sidebar scrollport", () => {
+    const { container } = customRender({ items: createSidebarItems(2) })
+    const owner = container.querySelector('[aria-label="Resource logs"]')
+    // The virtualized scrollport must disable native scroll anchoring, or the
+    // browser rewrites scrollTop as the synthetic spacers resize and traps the
+    // wheel (scroll-anchor trap, worst at DPR 2). jsdom cannot compute
+    // overflow-anchor, so assert the rule reached the emitted stylesheet; the
+    // DPR-2 browser probe verifies the behavior.
+    const classes = Array.from(owner?.classList ?? [])
+    const rule = Array.from(document.querySelectorAll("style"))
+      .map((sheet) => sheet.textContent || "")
+      .join("\n")
+      .split("}")
+      .filter((block) => classes.some((cls) => block.includes(`.${cls}`)))
+      .join("}")
+    expect(rule).toContain("overflow-anchor:none")
+  })
+
   describe("starring resources", () => {
     const items = createSidebarItems(2)
 

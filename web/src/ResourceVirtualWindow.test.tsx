@@ -1,7 +1,10 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import React from "react"
 import { ResourceVirtualEntry } from "./ResourceVirtualModel"
-import { ResourceVirtualWindow } from "./ResourceVirtualWindow"
+import {
+  ResourceVirtualWindow,
+  targetAnchorSettled,
+} from "./ResourceVirtualWindow"
 import { RESOURCE_VIRTUAL_BOOTSTRAP_SIZE } from "./ResourceVirtualRange"
 
 class ResizeObserverStub {
@@ -46,6 +49,22 @@ const entries: ReadonlyArray<ResourceVirtualEntry<string>> = Array.from(
     layoutKey: "default",
   })
 )
+
+describe("targetAnchorSettled", () => {
+  // The full trap (a selected resource force-scrolled into view every frame) is
+  // a DPR-2 sub-pixel effect that only reproduces in a real browser; this guards
+  // the settle contract that fix depends on against a regression to `=== 0`.
+  it("treats a sub-pixel residual adjustment as settled so a target completes", () => {
+    expect(targetAnchorSettled(0)).toBe(true)
+    expect(targetAnchorSettled(0.4)).toBe(true)
+    expect(targetAnchorSettled(-0.9)).toBe(true)
+    expect(targetAnchorSettled(1)).toBe(true)
+  })
+  it("treats a multi-pixel gap as unsettled so positioning keeps correcting", () => {
+    expect(targetAnchorSettled(2)).toBe(false)
+    expect(targetAnchorSettled(-40)).toBe(false)
+  })
+})
 
 it("bootstraps one logical item without rendering every resource", () => {
   render(
@@ -1156,4 +1175,79 @@ it("adopts a settled target as the next anchor before allowing scroll or a repea
   expect(owner.scrollTop).toBe(200)
   HTMLElement.prototype.getBoundingClientRect = originalRect
   owner.remove()
+})
+
+it("does not revert an in-flight user scroll when a data re-render races the scroll frame", async () => {
+  const owner = document.createElement("div")
+  Object.defineProperty(owner, "clientHeight", {
+    configurable: true,
+    value: 100,
+  })
+  document.body.appendChild(owner)
+  const ownerRef = { current: owner }
+  const originalRect = HTMLElement.prototype.getBoundingClientRect
+  HTMLElement.prototype.getBoundingClientRect = function () {
+    if (this === owner) return { top: 0, height: 100 } as DOMRect
+    return { height: 20 } as DOMRect
+  }
+  const frames: FrameRequestCallback[] = []
+  const requestFrame = jest
+    .spyOn(window, "requestAnimationFrame")
+    .mockImplementation((callback) => {
+      frames.push(callback)
+      return frames.length
+    })
+  const flush = () =>
+    act(() => {
+      let guard = 0
+      while (frames.length && guard++ < 50)
+        frames.splice(0).forEach((callback) => callback(0))
+    })
+
+  // A fresh entries array per revision models the store pushing a new slice on
+  // every view update — the ordinary re-render that recomputes the range and
+  // re-runs the anchor capture, here made to race an in-flight user scroll.
+  function ScrollRaceHarness(props: { revision: number }) {
+    const shown = React.useMemo(() => entries.slice(), [props.revision])
+    return (
+      <ResourceVirtualWindow
+        entries={shown}
+        scrollOwnerRef={ownerRef}
+        renderEntry={(entry, onElement) => (
+          <span ref={onElement}>
+            {entry.kind === "resource" ? entry.resourceName : entry.kind}
+          </span>
+        )}
+      />
+    )
+  }
+
+  try {
+    const view = render(<ScrollRaceHarness revision={0} />, {
+      container: owner,
+    })
+    flush()
+    await waitFor(() => expect(screen.getByText("row-0")).toBeInTheDocument())
+    flush()
+    expect(owner.scrollTop).toBe(0)
+
+    // The user scrolls down. The scroll listener nulls the anchor and queues a
+    // geometry frame that has not run yet.
+    owner.scrollTop = 200
+    fireEvent.scroll(owner)
+
+    // A store update re-renders before that frame lands. Geometry still reads
+    // the pre-scroll position; the anchor must not be baselined from it.
+    view.rerender(<ScrollRaceHarness revision={1} />)
+
+    // The queued geometry frame now catches up to the scrolled position.
+    flush()
+
+    // The user's scroll must stand — no retained-anchor snap-back to 0.
+    expect(owner.scrollTop).toBe(200)
+  } finally {
+    HTMLElement.prototype.getBoundingClientRect = originalRect
+    requestFrame.mockRestore()
+    owner.remove()
+  }
 })
