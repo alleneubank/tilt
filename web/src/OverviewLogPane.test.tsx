@@ -539,6 +539,62 @@ describe("OverviewLogPane", () => {
       expect(component.renderBufferRafId).toBe(before)
     })
 
+    it("holds follow when a content-shrink clamp keeps the pane at the bottom", () => {
+      renderAllScheduledFrames()
+      let root = component.rootRef.current
+      component.autoscroll = true
+      // Following, pinned at the bottom of an overflowing pane.
+      Object.defineProperty(root, "clientHeight", {
+        configurable: true,
+        value: 300,
+      })
+      Object.defineProperty(root, "scrollHeight", {
+        configurable: true,
+        value: 1000,
+      })
+      root.scrollTop = 700
+      component.scrollTop = 700
+      // A filter keystroke clears and recompacts the tail: content shrinks and
+      // the browser clamps scrollTop to the new (lower) bottom. The clamp's
+      // scroll event races ahead of the follow re-pin, so this.scrollTop is the
+      // stale pre-shrink bottom (700). The pane is still pinned at the bottom
+      // (scrollTop === max), so this is not a reader scroll-up and follow holds.
+      Object.defineProperty(root, "scrollHeight", {
+        configurable: true,
+        value: 500,
+      })
+      root.scrollTop = 200
+      component.onScroll()
+      expect(component.autoscroll).toBe(true)
+    })
+
+    it("holds follow when a filtered tail collapses below the viewport and clamps to top", () => {
+      renderAllScheduledFrames()
+      let root = component.rootRef.current
+      component.autoscroll = true
+      Object.defineProperty(root, "clientHeight", {
+        configurable: true,
+        value: 300,
+      })
+      Object.defineProperty(root, "scrollHeight", {
+        configurable: true,
+        value: 1000,
+      })
+      root.scrollTop = 700
+      component.scrollTop = 700
+      // The sparse filter result no longer fills the viewport (scrollHeight <=
+      // clientHeight), so the browser clamps scrollTop to 0. That top-boundary
+      // clamp is a content shrink, not a reader scrolling up to request older
+      // history, so follow must not disengage.
+      Object.defineProperty(root, "scrollHeight", {
+        configurable: true,
+        value: 300,
+      })
+      root.scrollTop = 0
+      component.onScroll()
+      expect(component.autoscroll).toBe(true)
+    })
+
     it("carries the no-eviction budget into a continuation pass", () => {
       renderAllScheduledFrames()
       let root = component.rootRef.current

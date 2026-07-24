@@ -435,6 +435,13 @@ export const returnToTailProximityPx = 48
 // not leave follow mode (top-boundary scrollTop === 0 still loads history).
 export const leaveFollowHysteresisPx = 8
 
+// A content-shrink clamp (filter recompaction / tail compaction) lowers
+// scrollTop to the new bottom while following, landing within a sub-pixel of the
+// bottom. Anything within this margin of the bottom is a clamp, not a leave
+// gesture; kept well under leaveFollowHysteresisPx so a real upward move never
+// falls inside it.
+export const followTailClampPx = 4
+
 /** Pure geometry: true when scroll position is within proximity of the bottom. */
 export function isNearScrollBottom(
   scrollTop: number,
@@ -916,6 +923,22 @@ export class OverviewLogComponent extends Component<OverviewLogComponentProps> {
     // requests exactly one older window. Sub-threshold deltas stay in follow
     // (REQ-LOGPANE-007 hysteresis) so a one-line flick is not a trap.
     if (scrollTop < oldScrollTop) {
+      // A content-shrink clamp is not a reader gesture. While following, tail
+      // compaction and filter recompaction shrink the rendered content; the
+      // browser then lowers scrollTop to the new (lower) bottom, firing a scroll
+      // event that looks like an upward move but leaves the pane pinned at the
+      // bottom. Treating it as a scroll-up is the filter-follow regression:
+      // typing a term repeatedly clears and recompacts the tail, and each clamp
+      // raced ahead of the re-pin's scrollTop record. scrollHeight is 0 only for
+      // unmeasured layout (jsdom); real geometry gates the check.
+      let maxScroll = rootEl.scrollHeight - rootEl.clientHeight
+      if (
+        this.autoscroll &&
+        rootEl.scrollHeight > 0 &&
+        maxScroll - scrollTop <= followTailClampPx
+      ) {
+        return
+      }
       if (scrollTop === 0) {
         this.hydrateAndScheduleHistoryAtTopBoundary("reader-movement")
       } else if (
