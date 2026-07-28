@@ -31,7 +31,16 @@ export default {
               <ResourceGroupsContextProvider>
                 <ResourceListOptionsProvider>
                   <ResourceSelectionProvider>
-                    <div style={{ margin: "-1rem" }}>
+                    <div
+                      style={{
+                        display: "flex",
+                        flexDirection: "column",
+                        height: "100vh",
+                        minHeight: 0,
+                        margin: "-1rem",
+                        overflow: "hidden",
+                      }}
+                    >
                       <Story />
                     </div>
                   </ResourceSelectionProvider>

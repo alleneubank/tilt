@@ -96,6 +96,10 @@ export const Name = styled.button`
   padding-bottom: ${SizeUnit(1 / 3)};
   text-align: left;
   cursor: pointer;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 
   &:hover {
     text-decoration: underline;
@@ -115,7 +119,15 @@ export const Name = styled.button`
 const Endpoint = styled.a`
   display: flex;
   align-items: center;
+  flex: 0 0 auto;
   max-width: 150px;
+`
+const Endpoints = styled.span`
+  display: flex;
+  flex-wrap: nowrap;
+  gap: ${SizeUnit(1 / 4)};
+  max-width: 100%;
+  overflow-x: auto;
 `
 const DetailText = styled.div`
   overflow: hidden;
@@ -166,11 +178,12 @@ const CustomActionButton = styled(ApiButton)`
 `
 const WidgetCell = styled.span`
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   max-width: ${SizeUnit(8)};
+  overflow-x: auto;
 
   .MuiButtonGroup-root {
-    margin-bottom: ${SizeUnit(0.125)};
+    flex: 0 0 auto;
     margin-right: ${SizeUnit(0.125)};
     margin-top: ${SizeUnit(0.125)};
   }
@@ -493,7 +506,7 @@ export function TableEndpointColumn({ row }: CellProps<RowValues>) {
       </Endpoint>
     )
   })
-  return <>{endpoints}</>
+  return <Endpoints>{endpoints}</Endpoints>
 }
 
 export function TableTriggerModeColumn({ row }: CellProps<RowValues>) {
