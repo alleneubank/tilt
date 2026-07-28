@@ -52,7 +52,9 @@ A subscriber's `OnChange` method is synchronized. The state store will not call
 `OnChange` again until the previous `OnChange` has finished.
 
 When a subscriber calls `Dispatch(action)`, that action is put into a FIFO
-queue, and the call returns immediately.
+queue. Log actions can apply bounded backpressure before entering the queue;
+log actions dispatched from the reducer context never block. Other actions
+return immediately.
 
 The state store typically processes actions in a batch after a backoff period,
 updating the state to reflect what's in the actions.
@@ -129,4 +131,3 @@ external services that subscribers need to interact with. Here's a partial listi
 - [cli](cli) - All Tilt CLI commands.
 
 - [web/src](../web/src) - The Tilt web interface.
-
