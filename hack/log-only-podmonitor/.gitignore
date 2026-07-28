@@ -1,0 +1,3 @@
+# Local soak artifacts (pprof, JSONL samples, generated Tiltfiles per run).
+# Reproduced by re-running log-only-podmonitor-perf.sh.
+reports/

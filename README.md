@@ -1,5 +1,43 @@
 # Tilt
 
+> **Fork disclaimer (`alleneubank/tilt`)**  
+> This repository is a **fork** of [tilt-dev/tilt](https://github.com/tilt-dev/tilt).
+> It carries performance work aimed at **canton-scale** localnets (heavy Compose/k8s
+> log volume, ~170+ resources): daemon log-ingress backpressure and store clamps,
+> plus HUD log-pane / resource-list virtualization (see [`web/SPEC.md`](web/SPEC.md)).
+>
+> **Many of these commits are not intended for upstream.** Commits that exist only
+> for this fork use the subject prefix **`[fork]`** (packaging, overlay releases,
+> this workflow). Upstreamable candidates keep normal conventional subjects and
+> may still need re-shaping before a tilt-dev PR. Policy: [`AGENTS.md`](AGENTS.md).
+>
+> **Install / pin:** linux/amd64 fork releases are published as prerelease tags
+> `v0.37.5-fork.<date>.g<sha>` (never GitHub “latest”). Consumers typically pin via
+> [`tilt-overlay`](https://github.com/alleneubank/tilt-overlay). Current dogfood
+> pin example: `0.37.5-fork.20260722.gb4791412e`.
+>
+> ### Benchmark results (hermetic HUD map, tilt-web-perf)
+>
+> Measured on release-equivalent builds with scrubbed canton-scale fixtures
+> (`k3d` + log-only podmonitor replay). Metric: **raw long-task duration**
+> (main-thread) unless noted. Floors and full map live in the sibling
+> [tilt-web-perf](https://github.com/alleneubank/tilt-web-perf) harness.
+>
+> | Journey | Pre-M5 (red) | Post-M5 (shipped evidence) | Gate |
+> | --- | ---: | ---: | ---: |
+> | Cold-start raw long-task | **984 ms** | **428 / 426 ms** | ≤ 492 ms |
+> | All-logs firehose raw long-task | **1556 ms** | **439 / 423 ms** | ≤ 778 ms |
+> | Busy-resource retained heap slope | **15.27 MB/min** (absolute red) | **3.01 MB/min** | ≤ 5 MB/min |
+>
+> Additional product floors verified with the same program: log pane mounts at
+> most **750** rendered lines with full history still reachable; return-to-tail
+> after scrolling up (`e2e:log-pane`). Whole-HUD overview/sidebar mount bounds
+> under ~176-resource scale are specified in `web/SPEC.md` (REQ-HUDPERF-*).
+>
+> Engine-side log pipeline work (store ingress clamp / backpressure) was
+> validated on earlier hermetic soaks and monorepo localnet dogfood; the table
+> above is the ratified **HUD** map-gate evidence for the virtualization pass.
+
 <img src="assets/logo-wordmark.png" width="250">
 
 [![Build Status](https://circleci.com/gh/tilt-dev/tilt/tree/master.svg?style=shield)](https://circleci.com/gh/tilt-dev/tilt)
