@@ -67,5 +67,8 @@ integration/.kube
 # Claude Code state files
 .claude/
 
+# Hunk review sidecar
+.hunk/
+
 # Built binary at repo root
 /tilt
