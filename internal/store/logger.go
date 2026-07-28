@@ -21,6 +21,19 @@ func NewLogActionLogger(ctx context.Context, dispatch func(action Action)) logge
 	})
 }
 
+// NewLoopLogActionLogger creates the logger installed only on the context
+// handed to Store reducers. Its actions carry their own ingress exemption, so
+// concurrent external writes cannot observe or borrow that exemption.
+func NewLoopLogActionLogger(ctx context.Context, dispatch func(action Action)) logger.Logger {
+	l := logger.Get(ctx)
+	return logger.NewFuncLogger(l.SupportsColor(), l.Level(), func(level logger.Level, fields logger.Fields, b []byte) error {
+		action := NewGlobalLogAction(level, b)
+		action.nonBlockingIngress = true
+		dispatch(action)
+		return nil
+	})
+}
+
 // Read labels and annotations of the given API object to determine where to log,
 // panicking if there's no info available.
 func MustObjectLogHandler(ctx context.Context, st Dispatcher, obj metav1.Object) context.Context {

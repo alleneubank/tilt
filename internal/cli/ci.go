@@ -93,6 +93,7 @@ func (c *ciCmd) run(ctx context.Context, args []string) error {
 	l := store.NewLogActionLogger(ctx, upper.Dispatch)
 	deferred.SetOutput(l)
 	ctx = redirectLogs(ctx, l)
+	ctx = store.CtxWithLoopLogger(ctx, store.NewLoopLogActionLogger(ctx, upper.Dispatch))
 	if c.outputSnapshotOnExit != "" {
 		defer cmdCIDeps.Snapshotter.WriteSnapshot(ctx, c.outputSnapshotOnExit)
 	}
