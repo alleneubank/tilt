@@ -30,6 +30,11 @@ type LogAction struct {
 	fields    logger.Fields
 	msg       []byte
 	level     logger.Level
+
+	// nonBlockingIngress is reserved for actions created by the Store loop's
+	// logger. That loop is the only consumer which can release the ingress
+	// budget, so its own log action must never wait for capacity.
+	nonBlockingIngress bool
 }
 
 func (LogAction) Action() {}

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
@@ -14,6 +15,20 @@ import (
 
 // Allow actions to batch together a bit.
 const actionBatchWindow = time.Millisecond
+
+// maxQueuedLogBytes bounds log payloads that have entered the Store but have
+// not reached the reducer. A firehose from `tilt up --stream=true` previously
+// accumulated this queue until Tilt was OOM-killed. LogStore's 2 MiB limit is
+// applied only after reduction, so it cannot protect this ingress queue.
+const maxQueuedLogBytes int64 = 32 * 1024 * 1024
+
+type loopLoggerContextKey struct{}
+
+// CtxWithLoopLogger installs logger only for reductions performed by Store.Loop.
+// The host context's logger stays intact for subscribers and callers.
+func CtxWithLoopLogger(ctx context.Context, loopLogger logger.Logger) context.Context {
+	return context.WithValue(ctx, loopLoggerContextKey{}, loopLogger)
+}
 
 // Read-only store
 type RStore interface {
@@ -31,27 +46,52 @@ type Store struct {
 	sleeper     Sleeper
 	state       *EngineState
 	subscribers *subscriberList
-	actionQueue *actionQueue
+	actionQueue []Action
 	actionCh    chan []Action
-	mu          sync.Mutex
-	stateMu     sync.RWMutex
-	reduce      Reducer
-	logActions  bool
+	actionReady chan struct{}
+	// ingressMu exclusively protects ingress state. Dispatch deliberately does
+	// not take mu: Store tests and callers use mu to coordinate broadcasting,
+	// and making enqueue contend on it can deadlock a dispatcher.
+	ingressMu       sync.Mutex
+	logBudget       *sync.Cond
+	closedStore     bool
+	workerStopped   bool
+	mu              sync.Mutex
+	closeOnce       sync.Once
+	workerCtx       context.Context
+	cancelWorker    context.CancelFunc
+	workerStartOnce sync.Once
+	workerStopOnce  sync.Once
+	stateMu         sync.RWMutex
+	reduce          Reducer
+	logActions      bool
+
+	// queuedLogBytes is observability for log payloads accepted by Dispatch
+	// but not yet reduced.
+	queuedLogBytes atomic.Int64
+
+	// drainStarts is observability for drain goroutines started by Dispatch.
+	drainStarts atomic.Int64
 
 	// TODO(nick): Define Subscribers and Reducers.
 	// The actionChan is an intermediate representation to make the transition easier.
 }
 
 func NewStore(reducer Reducer, logActions LogActionsFlag) *Store {
-	return &Store{
-		sleeper:     DefaultSleeper(),
-		state:       NewState(),
-		reduce:      reducer,
-		actionQueue: &actionQueue{},
-		actionCh:    make(chan []Action),
-		subscribers: &subscriberList{},
-		logActions:  bool(logActions),
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	s := &Store{
+		sleeper:      DefaultSleeper(),
+		state:        NewState(),
+		reduce:       reducer,
+		actionCh:     make(chan []Action),
+		actionReady:  make(chan struct{}, 1),
+		subscribers:  &subscriberList{},
+		logActions:   bool(logActions),
+		workerCtx:    workerCtx,
+		cancelWorker: cancelWorker,
 	}
+	s.logBudget = sync.NewCond(&s.ingressMu)
+	return s
 }
 
 // Returns a Store with a fake reducer that saves observed actions and makes
@@ -122,12 +162,72 @@ func (s *Store) UnlockMutableState() {
 }
 
 func (s *Store) Dispatch(action Action) {
-	s.actionQueue.add(action)
-	go s.drainActions()
+	logBytes := logActionPayloadBytes(action)
+
+	s.ingressMu.Lock()
+	// A reducer-originated logger action must never wait for capacity that only
+	// the reducer can release. The exemption lives on that action at creation,
+	// not in shared Store state, so external producers cannot race into it.
+	// External producers use a soft limit: the payload that crosses the cap is
+	// admitted, then later producers wait. This bounds overshoot to one external
+	// payload without dropping any logs.
+	for logBytes > 0 && !nonBlockingIngress(action) && s.queuedLogBytes.Load() > maxQueuedLogBytes && !s.closedStore && !s.workerStopped {
+		s.logBudget.Wait()
+	}
+	if s.closedStore || s.workerStopped {
+		s.ingressMu.Unlock()
+		return
+	}
+	s.queuedLogBytes.Add(logBytes)
+	s.actionQueue = append(s.actionQueue, action)
+	s.workerStartOnce.Do(func() {
+		go s.drainActions()
+	})
+	s.ingressMu.Unlock()
+
+	select {
+	case s.actionReady <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Store) stopDrainWorker() {
+	s.workerStopOnce.Do(func() {
+		s.ingressMu.Lock()
+		s.workerStopped = true
+		s.logBudget.Broadcast()
+		s.ingressMu.Unlock()
+		s.cancelWorker()
+	})
+}
+
+// QueuedLogBytesForTesting reports the payload bytes that have been accepted
+// by Dispatch but not yet reduced.
+func (s *Store) QueuedLogBytesForTesting() int64 {
+	return s.queuedLogBytes.Load()
+}
+
+// DrainStartsForTesting reports the long-lived drain workers that have started.
+func (s *Store) DrainStartsForTesting() int64 {
+	return s.drainStarts.Load()
 }
 
 func (s *Store) Close() {
-	close(s.actionCh)
+	s.closeOnce.Do(func() {
+		s.ingressMu.Lock()
+		s.closedStore = true
+		s.logBudget.Broadcast()
+		if !s.workerStopped {
+			s.workerStartOnce.Do(func() {
+				go s.drainActions()
+			})
+		}
+		s.ingressMu.Unlock()
+		select {
+		case s.actionReady <- struct{}{}:
+		default:
+		}
+	})
 }
 
 func (s *Store) SetUpSubscribersForTesting(ctx context.Context) error {
@@ -140,6 +240,12 @@ func (s *Store) Loop(ctx context.Context) error {
 		return err
 	}
 	defer s.subscribers.TeardownAll(context.Background())
+	defer s.stopDrainWorker()
+
+	loopCtx := ctx
+	if loopLogger, ok := ctx.Value(loopLoggerContextKey{}).(logger.Logger); ok {
+		loopCtx = logger.WithLogger(ctx, loopLogger)
+	}
 
 	// Set up a defer handler, and make sure to unlock the state
 	// if the control loop is interrupted by a panic.
@@ -157,7 +263,15 @@ func (s *Store) Loop(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 
-		case actions := <-s.actionCh:
+		case actions, ok := <-s.actionCh:
+			if !ok {
+				return nil
+			}
+			// Release capacity as soon as the drain worker hands the batch to the
+			// control loop, before taking stateMu. A subscriber can hold a read
+			// lock while dispatching a log action; releasing after stateMu would
+			// create a lock triangle that prevents the reducer from ever running.
+			s.releaseQueuedLogBytes(actions)
 			s.stateMu.Lock()
 			hasStateLock = true
 
@@ -169,7 +283,7 @@ func (s *Store) Loop(ctx context.Context) error {
 					oldState = s.cheapCopyState()
 				}
 
-				s.reduce(ctx, s.state, action)
+				s.reduce(loopCtx, s.state, action)
 
 				if summarizer, ok := action.(Summarizer); ok {
 					summarizer.Summarize(&summary)
@@ -208,6 +322,43 @@ func (s *Store) Loop(ctx context.Context) error {
 	}
 }
 
+func (s *Store) releaseQueuedLogBytes(actions []Action) {
+	var released int64
+	for _, action := range actions {
+		released += logActionPayloadBytes(action)
+	}
+	if released == 0 {
+		return
+	}
+
+	s.ingressMu.Lock()
+	s.queuedLogBytes.Add(-released)
+	s.logBudget.Broadcast()
+	s.ingressMu.Unlock()
+}
+
+func logActionPayloadBytes(action Action) int64 {
+	switch action := action.(type) {
+	case LogAction:
+		return int64(len(action.msg))
+	case *LogAction:
+		return int64(len(action.msg))
+	default:
+		return 0
+	}
+}
+
+func nonBlockingIngress(action Action) bool {
+	switch action := action.(type) {
+	case LogAction:
+		return action.nonBlockingIngress
+	case *LogAction:
+		return action.nonBlockingIngress
+	default:
+		return false
+	}
+}
+
 func (s *Store) maybeFinished() (bool, error) {
 	state := s.RLockState()
 	defer s.RUnlockState()
@@ -236,40 +387,52 @@ func (s *Store) maybeFinished() (bool, error) {
 }
 
 func (s *Store) drainActions() {
-	s.sleeper.Sleep(context.Background(), actionBatchWindow)
+	s.drainStarts.Add(1)
+	for {
+		// Coalesce a burst so the established batching window is retained while
+		// a single worker preserves action order without a goroutine per dispatch.
+		select {
+		case <-s.actionReady:
+		case <-s.workerCtx.Done():
+			return
+		}
+		s.sleeper.Sleep(s.workerCtx, actionBatchWindow)
+		if s.workerCtx.Err() != nil {
+			return
+		}
 
-	// The mutex here ensures that the actions appear on the channel in-order.
-	// Otherwise, two drains can interleave badly.
-	s.mu.Lock()
-	defer s.mu.Unlock()
+		s.ingressMu.Lock()
+		actions := s.actionQueue
+		s.actionQueue = nil
+		closed := s.closedStore
+		s.ingressMu.Unlock()
 
-	actions := s.actionQueue.drain()
-	if len(actions) > 0 {
-		s.actionCh <- actions
+		if len(actions) > 0 {
+			// mu gates the hand-off to the control loop. Callers and tests use it
+			// to make a burst one broadcast; Dispatch must not take this mutex.
+			s.mu.Lock()
+			select {
+			case s.actionCh <- actions:
+			case <-s.workerCtx.Done():
+				s.mu.Unlock()
+				return
+			}
+			s.mu.Unlock()
+		}
+
+		s.ingressMu.Lock()
+		closed = closed || s.closedStore
+		empty := len(s.actionQueue) == 0
+		s.ingressMu.Unlock()
+		if closed && empty {
+			close(s.actionCh)
+			return
+		}
 	}
 }
 
 type Action interface {
 	Action()
-}
-
-type actionQueue struct {
-	actions []Action
-	mu      sync.Mutex
-}
-
-func (q *actionQueue) add(action Action) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.actions = append(q.actions, action)
-}
-
-func (q *actionQueue) drain() []Action {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	result := append([]Action{}, q.actions...)
-	q.actions = nil
-	return result
 }
 
 type LogActionsFlag bool
