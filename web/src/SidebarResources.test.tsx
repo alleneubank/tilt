@@ -1,4 +1,5 @@
 import {
+  act,
   fireEvent,
   render,
   RenderOptions,
@@ -249,6 +250,28 @@ describe("SidebarResources", () => {
         } as DOMRect
       return { top: 0, bottom: 10, height: 10 } as DOMRect
     }
+    // Geometry is measured on animation frames. Delivering them explicitly
+    // keeps the outcome independent of how quickly jsdom's timer-driven frames
+    // arrive on a loaded machine.
+    const frameCallbacks: FrameRequestCallback[] = []
+    const requestFrame = jest
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation((callback) => {
+        frameCallbacks.push(callback)
+        return frameCallbacks.length
+      })
+    const maxFramesToSettle = 50
+    const settleFrames = () => {
+      for (
+        let frame = 0;
+        frame < maxFramesToSettle && frameCallbacks.length > 0;
+        frame++
+      )
+        act(() =>
+          frameCallbacks.splice(0).forEach((callback) => callback(frame))
+        )
+      expect(frameCallbacks).toHaveLength(0)
+    }
     const view = customRender({ items })
     const sidebarOwner = screen.getByLabelText("Resource logs") as HTMLElement
     owner = sidebarOwner
@@ -260,9 +283,8 @@ describe("SidebarResources", () => {
     try {
       sidebarOwner.scrollTop = 100
       fireEvent.scroll(sidebarOwner)
-      await waitFor(() =>
-        expect(screen.getByText(items[10].name)).toBeInTheDocument()
-      )
+      settleFrames()
+      expect(screen.getByText(items[10].name)).toBeInTheDocument()
       expect(
         screen.getByText(items[10].name).closest('[role="region"]')
       ).toHaveAccessibleName("team resources")
@@ -277,7 +299,8 @@ describe("SidebarResources", () => {
           resourceListOptions={DEFAULT_OPTIONS}
         />
       )
-      await waitFor(() => expect(sidebarOwner.scrollTop).toBe(460))
+      settleFrames()
+      expect(sidebarOwner.scrollTop).toBe(460)
       expect(
         sidebarOwner.querySelectorAll("[data-name]").length
       ).toBeLessThanOrEqual(12)
@@ -289,6 +312,7 @@ describe("SidebarResources", () => {
           ).toBeGreaterThanOrEqual(0)
         )
     } finally {
+      requestFrame.mockRestore()
       HTMLElement.prototype.getBoundingClientRect = originalRect
     }
   })
