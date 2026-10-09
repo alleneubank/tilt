@@ -226,9 +226,9 @@ describe("SidebarResources", () => {
     installDefaultGeometry()
   })
 
-  it("uses the list origin, rather than sidebar chrome, for bounded owner scrolling", async () => {
-    const items = createSidebarItems(50)
-    items.forEach((item) => (item.labels = ["team"]))
+  // A 40px owner whose list starts 30px below its top (sidebar chrome), with
+  // animation frames queued so each test chooses when geometry is sampled.
+  function renderBoundedOwner(items: SidebarItem[]) {
     const originalRect = HTMLElement.prototype.getBoundingClientRect
     let owner: HTMLElement | null = null
     HTMLElement.prototype.getBoundingClientRect = function () {
@@ -250,9 +250,6 @@ describe("SidebarResources", () => {
         } as DOMRect
       return { top: 0, bottom: 10, height: 10 } as DOMRect
     }
-    // Geometry is measured on animation frames. Delivering them explicitly
-    // keeps the outcome independent of how quickly jsdom's timer-driven frames
-    // arrive on a loaded machine.
     const frameCallbacks: FrameRequestCallback[] = []
     const requestFrame = jest
       .spyOn(window, "requestAnimationFrame")
@@ -260,18 +257,6 @@ describe("SidebarResources", () => {
         frameCallbacks.push(callback)
         return frameCallbacks.length
       })
-    const maxFramesToSettle = 50
-    const settleFrames = () => {
-      for (
-        let frame = 0;
-        frame < maxFramesToSettle && frameCallbacks.length > 0;
-        frame++
-      )
-        act(() =>
-          frameCallbacks.splice(0).forEach((callback) => callback(frame))
-        )
-      expect(frameCallbacks).toHaveLength(0)
-    }
     const view = customRender({ items })
     const sidebarOwner = screen.getByLabelText("Resource logs") as HTMLElement
     owner = sidebarOwner
@@ -279,32 +264,63 @@ describe("SidebarResources", () => {
       configurable: true,
       value: 40,
     })
+    const maxFramesToSettle = 50
+    return {
+      owner: sidebarOwner,
+      settleFrames() {
+        for (
+          let frame = 0;
+          frame < maxFramesToSettle && frameCallbacks.length > 0;
+          frame++
+        )
+          act(() =>
+            frameCallbacks.splice(0).forEach((callback) => callback(frame))
+          )
+        expect(frameCallbacks).toHaveLength(0)
+      },
+      select(name: string) {
+        view.rerender(
+          <SidebarResources
+            items={items}
+            selected={name}
+            resourceView={ResourceView.Log}
+            pathBuilder={pathBuilder}
+            resourceListOptions={DEFAULT_OPTIONS}
+          />
+        )
+      },
+      restore() {
+        requestFrame.mockRestore()
+        HTMLElement.prototype.getBoundingClientRect = originalRect
+      },
+    }
+  }
 
+  function labeledItems(count: number) {
+    const items = createSidebarItems(count)
+    items.forEach((item) => (item.labels = ["team"]))
+    return items
+  }
+
+  it("uses the list origin, rather than sidebar chrome, for bounded owner scrolling", () => {
+    const items = labeledItems(50)
+    const sidebar = renderBoundedOwner(items)
     try {
-      sidebarOwner.scrollTop = 100
-      fireEvent.scroll(sidebarOwner)
-      settleFrames()
+      sidebar.owner.scrollTop = 100
+      fireEvent.scroll(sidebar.owner)
+      sidebar.settleFrames()
       expect(screen.getByText(items[10].name)).toBeInTheDocument()
       expect(
         screen.getByText(items[10].name).closest('[role="region"]')
       ).toHaveAccessibleName("team resources")
 
-      const target = items[45]
-      view.rerender(
-        <SidebarResources
-          items={items}
-          selected={target.name}
-          resourceView={ResourceView.Log}
-          pathBuilder={pathBuilder}
-          resourceListOptions={DEFAULT_OPTIONS}
-        />
-      )
-      settleFrames()
-      expect(sidebarOwner.scrollTop).toBe(460)
+      sidebar.select(items[45].name)
+      sidebar.settleFrames()
+      expect(sidebar.owner.scrollTop).toBe(460)
       expect(
-        sidebarOwner.querySelectorAll("[data-name]").length
+        sidebar.owner.querySelectorAll("[data-name]").length
       ).toBeLessThanOrEqual(12)
-      sidebarOwner
+      sidebar.owner
         .querySelectorAll<HTMLElement>('li[aria-hidden="true"]')
         .forEach((spacer) =>
           expect(
@@ -312,8 +328,24 @@ describe("SidebarResources", () => {
           ).toBeGreaterThanOrEqual(0)
         )
     } finally {
-      requestFrame.mockRestore()
-      HTMLElement.prototype.getBoundingClientRect = originalRect
+      sidebar.restore()
+    }
+  })
+
+  it("positions a selection made before its scroll's geometry frame from the current viewport", () => {
+    const items = labeledItems(50)
+    const sidebar = renderBoundedOwner(items)
+    try {
+      // No frame runs between the scroll and the selection, so the only
+      // geometry snapshot still describes the pre-scroll viewport.
+      sidebar.owner.scrollTop = 100
+      fireEvent.scroll(sidebar.owner)
+      sidebar.select(items[45].name)
+      sidebar.settleFrames()
+      expect(sidebar.owner.scrollTop).toBe(460)
+      expect(screen.getByText(items[45].name)).toBeInTheDocument()
+    } finally {
+      sidebar.restore()
     }
   })
 
